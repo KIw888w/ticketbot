@@ -23,25 +23,23 @@ const axios = require('axios');
 // [ 3. Config / Constants ]
 // ==========================================
 // ⚠️ แก้ไอดีเหล่านี้ให้ตรงกับเซิร์ฟเวอร์ของคุณก่อนรันบอท
-const ADMIN_ROLE_ID      = '1512646616321097818'; // Role แอดมินที่รับออเดอร์/เรื่องสอบถามได้
-const TICKET_CATEGORY_ID = '1551990531113099335'; // Category สำหรับสร้างห้องออเดอร์ + ห้องสอบถาม
-const DONE_CATEGORY_ID   = '1551991162724683827'; // Category ที่ย้ายห้องไปเก็บหลังจบงาน
-const REVIEW_CHANNEL_ID  = '1551991014854762638'; // ห้องรีวิว
+const ADMIN_ROLE_ID              = '1555146265958944878'; // Role แอดมินที่รับออเดอร์/เรื่องสอบถามได้
+const TICKET_CATEGORY_ID         = '1554881839422906496'; // Category สำหรับสร้างห้องออเดอร์ + ห้องสอบถาม
+const DONE_CATEGORY_ID           = '1554881839745994884'; // Category ที่ย้ายห้องไปเก็บหลังจบงาน
+const REVIEW_CHANNEL_ID          = '1554881839745994883'; // ห้องรีวิว (เอาไว้นับจำนวน + รีแอค)
+const SLIP_NOTIFY_CHANNEL_ID = '1555145911879864380'; // ห้องแจ้งเตือนเมื่อตรวจสอบสลิปผ่านแล้ว (ทุกช่องทางการจ่าย)
 
-const PROMPTPAY_NUMBER   = '0621473585'; // เบอร์พร้อมเพย์รับเงิน
-const EASYSLIP_API_KEY   = process.env.EASYSLIP_API_KEY; // ⚠️ สมัครขอคีย์ที่ document.easyslip.com แล้วใส่ในไฟล์ .env
+const PROMPTPAY_NUMBER = '0621473585'; // เบอร์พร้อมเพย์รับเงิน
+const TRUEMONEY_NUMBER = '0621473585'; // ⚠️ เบอร์ TrueMoney Wallet ที่รับโอน ถ้าคนละเบอร์กับพร้อมเพย์ให้แก้ตรงนี้
+const EASYSLIP_API_KEY = process.env.EASYSLIP_API_KEY; // ⚠️ สมัครขอคีย์ที่ document.easyslip.com แล้วใส่ในไฟล์ .env
 
-const QUEUE_FILE  = './queue.txt';
-const TICKET_FILE = './active_tickets.json';
+const QUEUE_FILE        = './queue.txt';
+const TICKET_FILE       = './active_tickets.json';
+const REVIEW_COUNT_FILE = './review_count.json';
 
 // ==========================================
-// [ 4. Packages / Pricing Data ]
+// [ 4. Packages Data ]
 // ==========================================
-// จำกัดช่วงยอดเติม TrueMoney Wallet — ยอดชำระ = ยอดที่เติมตรงๆ 1:1 (ไม่มีส่วนลด/บวกเพิ่ม)
-// เงื่อนไขราคาพิเศษใดๆ ให้แอดมินคุยกับลูกค้าเองในห้อง บอททำหน้าที่แค่สร้างห้อง + QR + อ่านสลิป
-const MIN_TRUEMONEY_AMOUNT = 20;
-const MAX_TRUEMONEY_AMOUNT = 10000;
-
 // แพ็กเกจ Discord Nitro
 let NITRO_PACKAGES = [
     { id: 'nitro_basic_1m', label: 'Nitro Basic — 1 เดือน', price: 50   },
@@ -53,9 +51,10 @@ let NITRO_PACKAGES = [
 // ==========================================
 // [ 5. Runtime State ]
 // ==========================================
-let orderFlow        = {}; // orderFlow[userId] = { category: 'truemoney'|'nitro'|'inquiry', pkg/amount/phone/question }
+let orderFlow        = {}; // orderFlow[userId] = { category: 'nitro'|'inquiry', pkg, price, question }
 let activeTicketData = {};
 let queueCount        = 1;
+let reviewCount        = 0;
 
 // ==========================================
 // [ 6. Helpers ]
@@ -73,10 +72,14 @@ function loadJSON(filePath, fallback = {}) {
 function loadPersistentData() {
     activeTicketData = loadJSON(TICKET_FILE, {});
     if (fs.existsSync(QUEUE_FILE)) queueCount = parseInt(fs.readFileSync(QUEUE_FILE, 'utf8')) || 1;
+
+    const reviewFile = loadJSON(REVIEW_COUNT_FILE, null);
+    if (reviewFile && typeof reviewFile.count === 'number') reviewCount = reviewFile.count;
 }
 
-function saveTickets()  { fs.writeFileSync(TICKET_FILE, JSON.stringify(activeTicketData, null, 2)); }
-function saveQueue()    { fs.writeFileSync(QUEUE_FILE, queueCount.toString()); }
+function saveTickets()     { fs.writeFileSync(TICKET_FILE, JSON.stringify(activeTicketData, null, 2)); }
+function saveQueue()       { fs.writeFileSync(QUEUE_FILE, queueCount.toString()); }
+function saveReviewCount() { fs.writeFileSync(REVIEW_COUNT_FILE, JSON.stringify({ count: reviewCount })); }
 
 loadPersistentData();
 
@@ -87,17 +90,21 @@ function buildQrUrl(amount) {
 
 /**
  * ตรวจสอบสลิปโอนเงินจริงผ่าน EasySlip API (https://document.easyslip.com)
- * ส่งลิงก์รูปสลิปไปตรวจกับธนาคาร เทียบว่าโอนจริงไหม + ยอดตรงไหม + เคยใช้สลิปนี้ยืนยันไปแล้วหรือยัง
+ * ใช้ endpoint ต่างกันตามช่องทางจ่าย: ธนาคาร/พร้อมเพย์ ใช้ /verify/bank, TrueMoney ใช้ /verify/truewallet
  * @returns {Promise<{ok:boolean, reason:string, data?:object}>}
  */
-async function verifySlip(imageUrl, expectedAmount) {
+async function verifySlip(imageUrl, expectedAmount, method = 'bank') {
     if (!EASYSLIP_API_KEY) {
         return { ok: false, reason: 'NO_API_KEY' };
     }
 
+    const endpoint = method === 'truemoney'
+        ? 'https://api.easyslip.com/v2/verify/truewallet'
+        : 'https://api.easyslip.com/v2/verify/bank';
+
     try {
         const res = await axios.post(
-            'https://api.easyslip.com/v2/verify/bank',
+            endpoint,
             {
                 url: imageUrl,
                 matchAmount: expectedAmount > 0 ? expectedAmount : undefined,
@@ -143,6 +150,14 @@ function slipErrorMessage(reason) {
     return map[reason] || 'ตรวจสอบสลิปไม่สำเร็จ กรุณาลองส่งใหม่อีกครั้ง หรือรอแอดมินตรวจสอบด้วยตนเอง';
 }
 
+/** แทนที่/เติมเลขรีวิวในชื่อห้อง รูปแบบ 〔1074〕 — ไม่แตะข้อความอื่นในชื่อห้อง */
+function buildReviewChannelName(currentName, count) {
+    if (/〔\d+〕/.test(currentName)) {
+        return currentName.replace(/〔\d+〕/, `〔${count}〕`);
+    }
+    return `${currentName}〔${count}〕`;
+}
+
 async function closeTicket(channelId, userId) {
     const chan = client.channels.cache.get(channelId);
     if (!chan) return;
@@ -160,10 +175,28 @@ const client = new Client({
 });
 
 // ==========================================
-// [ 8. Message Handler: ตรวจจับสลิป + คำสั่งแอดมิน ]
+// [ 8. Message Handler: ตรวจจับสลิป + นับรีวิว + คำสั่งแอดมิน ]
 // ==========================================
 client.on('messageCreate', async (message) => {
     if (!message.guild || message.author.bot) return;
+
+    // ── ระบบนับรีวิว ─────────────────────────────────────────────
+    if (message.channel.id === REVIEW_CHANNEL_ID) {
+        const isAdmin = message.member?.roles.cache.has(ADMIN_ROLE_ID);
+        if (!isAdmin) {
+            reviewCount++;
+            saveReviewCount();
+
+            const newName = buildReviewChannelName(message.channel.name, reviewCount);
+            if (newName !== message.channel.name) {
+                await message.channel.setName(newName).catch(err => {
+                    console.error('⚠️ เปลี่ยนชื่อห้องรีวิวไม่ได้ (อาจติด rate limit ของ Discord):', err.message);
+                });
+            }
+
+        }
+        return;
+    }
 
     // ── ตรวจจับ + ตรวจสอบสลิปอัตโนมัติในห้อง Ticket (เฉพาะห้องที่ต้องชำระเงิน) ──
     const ticketData = activeTicketData[message.channel.id];
@@ -175,15 +208,15 @@ client.on('messageCreate', async (message) => {
         if (isPayment && !isAdmin && image && !ticketData.slipVerified) {
             const checkingMsg = await message.reply('🔍 กำลังตรวจสอบสลิป กรุณารอสักครู่นะครับ...');
 
-            const result = await verifySlip(image.url, ticketData.price);
+            const result = await verifySlip(image.url, ticketData.price, ticketData.payMethod);
 
             if (result.ok) {
                 ticketData.slipVerified = true;
                 ticketData.slipReceived = true;
                 ticketData.slipInfo = {
-                    transRef: result.data.rawSlip.transRef,
-                    amount:   result.data.rawSlip.amount.amount,
-                    sender:   result.data.rawSlip.sender?.account?.name?.th ?? 'ไม่ทราบชื่อ'
+                    transRef: result.data.rawSlip?.transRef ?? '-',
+                    amount:   result.data.rawSlip?.amount?.amount ?? ticketData.price,
+                    sender:   result.data.rawSlip?.sender?.account?.name?.th ?? 'ไม่ทราบชื่อ'
                 };
                 saveTickets();
 
@@ -199,6 +232,24 @@ client.on('messageCreate', async (message) => {
 
                 await checkingMsg.edit({ content: null, embeds: [verifiedEmbed] });
                 await message.channel.send(`🔔 <@&${ADMIN_ROLE_ID}> ลูกค้าโอนเงินแล้ว **ตรวจสอบสลิปผ่าน ✅** (คิวที่ ${ticketData.qNum})`);
+
+                // แจ้งเตือนที่ห้องแจ้งสลิปกลาง ทุกช่องทางการจ่าย (ไม่ใช่แค่ TrueMoney)
+                const notifyChannel = client.channels.cache.get(SLIP_NOTIFY_CHANNEL_ID);
+                if (notifyChannel) {
+                    const methodLabel = ticketData.payMethod === 'truemoney' ? '💙 TrueMoney Wallet' : '💳 PromptPay';
+                    await notifyChannel.send({
+                        embeds: [new EmbedBuilder()
+                            .setColor('#2ECC71')
+                            .setTitle(`✅ มีการจ่ายผ่าน ${methodLabel} — ตรวจสอบสลิปผ่านแล้ว`)
+                            .addFields(
+                                { name: '👤 ลูกค้า',   value: `<@${ticketData.userId}>`, inline: true },
+                                { name: '📦 รายการ',   value: ticketData.label ?? '-', inline: true },
+                                { name: '💰 ยอดโอน',   value: `${ticketData.slipInfo.amount.toLocaleString()} บาท`, inline: true },
+                                { name: '🔖 เลขอ้างอิง', value: `\`${ticketData.slipInfo.transRef}\``, inline: false },
+                                { name: '📍 ห้องออเดอร์', value: `<#${message.channel.id}>`, inline: false }
+                            )]
+                    }).catch(() => {});
+                }
             } else {
                 // สลิปยังไม่ผ่าน — ไม่ mark ว่ารับยอดแล้ว ให้ลูกค้าส่งใหม่ได้
                 await checkingMsg.edit({ content: `❌ ${slipErrorMessage(result.reason)}` });
@@ -236,8 +287,7 @@ client.on('messageCreate', async (message) => {
 ✨ **เลือกบริการที่ต้องการด้านล่างนี้ครับ**
 ╰━━━━━━━━━━━━━━━━━━━━━━╯
 
-💸 **เติมเงิน TrueMoney Wallet**
-🚀 **เติมดิสคอร์ดไนโตร (Nitro)**
+🚀 **เติมดิสคอร์ดไนโตร (Nitro)** — จ่ายได้ทั้ง PromptPay QR และ TrueMoney Wallet
 ❓ **สอบถามข้อมูล / ติดต่อแอดมิน**
 
 💡 กดปุ่มเพื่อเริ่มใช้งานทันที`
@@ -246,7 +296,6 @@ client.on('messageCreate', async (message) => {
             .setFooter({ text: 'ระบบร้านค้าอัตโนมัติ' });
 
         const buttons = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId('start_truemoney').setLabel('เติมทรูมันนี่').setEmoji('💸').setStyle(ButtonStyle.Success),
             new ButtonBuilder().setCustomId('start_nitro').setLabel('เติมไนโตร').setEmoji('🚀').setStyle(ButtonStyle.Primary),
             new ButtonBuilder().setCustomId('start_inquiry').setLabel('สอบถาม').setEmoji('❓').setStyle(ButtonStyle.Secondary)
         );
@@ -271,49 +320,16 @@ client.on('messageCreate', async (message) => {
 // ════════════════════════════════════════════════════════════
 //  ORDER FLOW
 //
-//  Step 1 ► start_truemoney / start_nitro / start_inquiry → เปิด modal
-//  Step 2 ► modal_truemoney_submit  → สรุปออเดอร์ + ปุ่มยืนยัน/ยกเลิก
-//           sel_nitro_pkg           → สรุปออเดอร์ทันที
-//           modal_inquiry_submit    → สร้างห้องสอบถามทันที (ไม่มีขั้นตอนชำระเงิน)
-//  Step 3 ► flow_confirm            → สร้างห้องชำระเงิน + QR พร้อมเพย์ (truemoney/nitro)
+//  Step 1 ► start_nitro / start_inquiry → เปิดเมนู/modal
+//  Step 2 ► sel_nitro_pkg      → เลือกวิธีจ่าย (PromptPay / TrueMoney)
+//           modal_inquiry_submit → สร้างห้องสอบถามทันที (ไม่มีขั้นตอนชำระเงิน)
+//  Step 3 ► pay_promptpay / pay_truemoney → สร้างห้องชำระเงิน
 //
 //  ADMIN: btn_work → btn_done  |  btn_cancel
 // ════════════════════════════════════════════════════════════
 
 client.on('interactionCreate', async (interaction) => {
     try {
-        // ─────────────────────────────────────────────────────────
-        //  STEP 1  start_truemoney → เปิด modal กรอกเบอร์ + จำนวนเงิน
-        // ─────────────────────────────────────────────────────────
-        if (interaction.isButton() && interaction.customId === 'start_truemoney') {
-            orderFlow[interaction.user.id] = { category: 'truemoney' };
-
-            const modal = new ModalBuilder()
-                .setCustomId('modal_truemoney_submit')
-                .setTitle('💸 เติมเงิน TrueMoney Wallet');
-
-            modal.addComponents(
-                new ActionRowBuilder().addComponents(
-                    new TextInputBuilder()
-                        .setCustomId('phone_input')
-                        .setLabel('เบอร์ที่ผูกกับ TrueMoney Wallet')
-                        .setStyle(TextInputStyle.Short)
-                        .setPlaceholder('เช่น 0812345678')
-                        .setRequired(true)
-                ),
-                new ActionRowBuilder().addComponents(
-                    new TextInputBuilder()
-                        .setCustomId('amount_input')
-                        .setLabel(`จำนวนเงินที่ต้องการเติม (บาท) ${MIN_TRUEMONEY_AMOUNT}-${MAX_TRUEMONEY_AMOUNT}`)
-                        .setStyle(TextInputStyle.Short)
-                        .setPlaceholder('เช่น 100')
-                        .setRequired(true)
-                )
-            );
-
-            return interaction.showModal(modal);
-        }
-
         // ─────────────────────────────────────────────────────────
         //  STEP 1  start_nitro → เมนูเลือกแพ็กเกจไนโตร
         // ─────────────────────────────────────────────────────────
@@ -374,44 +390,7 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         // ─────────────────────────────────────────────────────────
-        //  STEP 2 (TrueMoney)  กรอกเบอร์+จำนวนเงินเสร็จ → สรุปออเดอร์
-        // ─────────────────────────────────────────────────────────
-        if (interaction.isModalSubmit() && interaction.customId === 'modal_truemoney_submit') {
-            const flow = orderFlow[interaction.user.id];
-            if (!flow) return interaction.reply({ content: '❌ ไม่พบออเดอร์ กรุณาเริ่มใหม่', ephemeral: true });
-
-            const phone  = interaction.fields.getTextInputValue('phone_input').trim();
-            const amount = parseInt(interaction.fields.getTextInputValue('amount_input').replace(/[^0-9]/g, ''));
-
-            if (!/^0[0-9]{9}$/.test(phone))
-                return interaction.reply({ content: '❌ เบอร์โทรศัพท์ไม่ถูกต้อง กรุณากรอกเบอร์ 10 หลัก เช่น 0812345678', ephemeral: true });
-
-            if (isNaN(amount) || amount < MIN_TRUEMONEY_AMOUNT || amount > MAX_TRUEMONEY_AMOUNT)
-                return interaction.reply({ content: `❌ จำนวนเงินต้องอยู่ระหว่าง ${MIN_TRUEMONEY_AMOUNT.toLocaleString()}-${MAX_TRUEMONEY_AMOUNT.toLocaleString()} บาท`, ephemeral: true });
-
-            flow.phone  = phone;
-            flow.amount = amount;
-            flow.price  = amount;
-
-            const embed = new EmbedBuilder()
-                .setTitle('🧾 สรุปการเติม TrueMoney Wallet')
-                .setColor('#F1C40F')
-                .setDescription('กรุณาตรวจสอบข้อมูลก่อนกดยืนยันเพื่อไปหน้าชำระเงินครับ')
-                .addFields(
-                    { name: '📱 เบอร์ TrueMoney', value: `\`${flow.phone}\``, inline: true },
-                    { name: '💰 ยอดชำระ', value: `**${flow.price.toLocaleString()} บาท**`, inline: false }
-                );
-
-            const row = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId('flow_confirm').setLabel('✅ ยืนยันเพื่อชำระเงิน').setStyle(ButtonStyle.Success),
-                new ButtonBuilder().setCustomId('cancel_order').setLabel('❌ ยกเลิก').setStyle(ButtonStyle.Danger)
-            );
-
-            return interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
-        }
-
-        // ─────────────────────────────────────────────────────────
-        //  STEP 2 (Nitro)  เลือกแพ็กเกจ → สรุปออเดอร์ทันที
+        //  STEP 2 (Nitro)  เลือกแพ็กเกจ → เลือกวิธีจ่ายเงิน
         // ─────────────────────────────────────────────────────────
         if (interaction.isStringSelectMenu() && interaction.customId === 'sel_nitro_pkg') {
             const pkg  = NITRO_PACKAGES.find(p => p.id === interaction.values[0]);
@@ -422,17 +401,14 @@ client.on('interactionCreate', async (interaction) => {
             flow.price = pkg.price;
 
             const embed = new EmbedBuilder()
-                .setTitle('🧾 สรุปการสั่งซื้อ Nitro')
+                .setTitle('💳 เลือกวิธีชำระเงิน')
                 .setColor('#F1C40F')
-                .setDescription('กรุณาตรวจสอบข้อมูลก่อนกดยืนยันเพื่อไปหน้าชำระเงินครับ')
-                .addFields(
-                    { name: '🚀 แพ็กเกจ', value: pkg.label, inline: true },
-                    { name: '💰 ยอดชำระ', value: `**${pkg.price.toLocaleString()} บาท**`, inline: true }
-                );
+                .setDescription(`แพ็กเกจที่เลือก: **${pkg.label}**\nยอดชำระ: **${pkg.price.toLocaleString()} บาท**\n\nกรุณาเลือกวิธีชำระเงินด้านล่างนี้ครับ`);
 
             const row = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId('flow_confirm').setLabel('✅ ยืนยันเพื่อชำระเงิน').setStyle(ButtonStyle.Success),
-                new ButtonBuilder().setCustomId('cancel_order').setLabel('❌ ยกเลิก').setStyle(ButtonStyle.Danger)
+                new ButtonBuilder().setCustomId('pay_promptpay').setLabel('PromptPay QR').setEmoji('💳').setStyle(ButtonStyle.Primary),
+                new ButtonBuilder().setCustomId('pay_truemoney').setLabel('TrueMoney Wallet').setEmoji('💙').setStyle(ButtonStyle.Success),
+                new ButtonBuilder().setCustomId('cancel_order').setLabel('ยกเลิก').setEmoji('❌').setStyle(ButtonStyle.Danger)
             );
 
             return interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
@@ -486,18 +462,18 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         // ─────────────────────────────────────────────────────────
-        //  STEP 3  flow_confirm → สร้างห้องชำระเงิน + QR พร้อมเพย์
+        //  STEP 3  pay_promptpay / pay_truemoney → สร้างห้องชำระเงิน
         // ─────────────────────────────────────────────────────────
-        if (interaction.isButton() && interaction.customId === 'flow_confirm') {
+        if (interaction.isButton() && (interaction.customId === 'pay_promptpay' || interaction.customId === 'pay_truemoney')) {
             const flow = orderFlow[interaction.user.id];
             if (!flow || !flow.price) return interaction.reply({ content: '❌ หมดเวลาทำรายการ กรุณาเริ่มใหม่', ephemeral: true });
 
             await interaction.deferReply({ ephemeral: true });
 
-            const isTrueMoney = flow.category === 'truemoney';
+            const payMethod = interaction.customId === 'pay_truemoney' ? 'truemoney' : 'promptpay';
 
             const channel = await interaction.guild.channels.create({
-                name:   isTrueMoney ? `คิว-ทรูมันนี่-${queueCount}` : `คิว-ไนโตร-${queueCount}`,
+                name:   `คิว-ไนโตร-${queueCount}`,
                 parent: TICKET_CATEGORY_ID,
                 permissionOverwrites: [
                     { id: interaction.guild.id, deny:  [PermissionFlagsBits.ViewChannel] },
@@ -507,19 +483,20 @@ client.on('interactionCreate', async (interaction) => {
             });
 
             activeTicketData[channel.id] = {
-                category: flow.category,
-                phone:    isTrueMoney ? flow.phone : null,
-                label:    isTrueMoney ? `เติม TrueMoney ${flow.amount.toLocaleString()} บาท` : flow.pkg.label,
-                amount:   isTrueMoney ? flow.amount : null,
-                price:    flow.price,
-                userId:   interaction.user.id,
-                qNum:     queueCount,
+                category:  'nitro',
+                payMethod,
+                label:     flow.pkg.label,
+                price:     flow.price,
+                userId:    interaction.user.id,
+                qNum:      queueCount,
                 slipReceived: false,
                 slipVerified: false
             };
             saveTickets();
 
-            const qrUrl = buildQrUrl(flow.price);
+            const paymentInstructions = payMethod === 'truemoney'
+                ? `📌 **วิธีชำระเงิน (TrueMoney Wallet):**\nเปิดแอป TrueMoney แล้วโอนเข้าเบอร์: \`${TRUEMONEY_NUMBER}\`\nยอดโอน: **${flow.price.toLocaleString()} บาท**`
+                : `📌 **วิธีชำระเงิน (PromptPay):**\nสแกน QR พร้อมเพย์ด้านล่างนี้ หรือโอนมาที่เบอร์: \`${PROMPTPAY_NUMBER}\``;
 
             const embed = new EmbedBuilder()
                 .setTitle(`🧾 หน้าชำระเงิน (คิวที่ ${queueCount})`)
@@ -528,16 +505,16 @@ client.on('interactionCreate', async (interaction) => {
 `สวัสดีครับ <@${interaction.user.id}>
 
 **ข้อมูลออเดอร์:**
-${isTrueMoney ? `📱 เบอร์ TrueMoney: \`${flow.phone}\`` : `🚀 แพ็กเกจ: **${flow.pkg.label}**`}
+🚀 แพ็กเกจ: **${flow.pkg.label}**
 💰 ยอดชำระ: **${flow.price.toLocaleString()} บาท**
 
-📌 **วิธีชำระเงิน:**
-สแกน QR พร้อมเพย์ด้านล่างนี้ หรือโอนมาที่เบอร์: \`${PROMPTPAY_NUMBER}\`
+${paymentInstructions}
 
 📸 **เมื่อโอนเสร็จแล้ว ให้ส่งรูปสลิปลงในห้องนี้ได้เลยครับ!**`
                 )
-                .setImage(qrUrl)
                 .setFooter({ text: 'เมื่อส่งสลิปแล้ว บอทจะตรวจสอบและตอบกลับอัตโนมัติ' });
+
+            if (payMethod === 'promptpay') embed.setImage(buildQrUrl(flow.price));
 
             const btns = new ActionRowBuilder().addComponents(
                 new ButtonBuilder().setCustomId('btn_work').setLabel('แอดมินรับงาน').setEmoji('🛠️').setStyle(ButtonStyle.Primary),
@@ -576,14 +553,9 @@ ${isTrueMoney ? `📱 เบอร์ TrueMoney: \`${flow.phone}\`` : `🚀 แ�
             const data = activeTicketData[interaction.channel.id];
             if (!data) return;
 
-            let doneText;
-            if (data.category === 'inquiry') {
-                doneText = `✅ เรื่องสอบถามของ <@${data.userId}> ได้รับการตอบกลับและปิดห้องแล้วครับ`;
-            } else if (data.category === 'truemoney') {
-                doneText = `✅ <@${data.userId}> ได้รับเงินเข้า TrueMoney Wallet **${data.amount.toLocaleString()} บาท** เรียบร้อยแล้ว!`;
-            } else {
-                doneText = `✅ <@${data.userId}> ได้รับ **${data.label}** เรียบร้อยแล้ว!`;
-            }
+            const doneText = data.category === 'inquiry'
+                ? `✅ เรื่องสอบถามของ <@${data.userId}> ได้รับการตอบกลับและปิดห้องแล้วครับ`
+                : `✅ <@${data.userId}> ได้รับ **${data.label}** เรียบร้อยแล้ว!`;
 
             const completionEmbed = new EmbedBuilder()
                 .setColor('#2ECC71').setTitle('🎉 ทำรายการเสร็จสิ้นแล้ว')
