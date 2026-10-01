@@ -23,8 +23,8 @@ const axios = require('axios');
 // [ 3. Config / Constants ]
 // ==========================================
 // ⚠️ แก้ไอดีเหล่านี้ให้ตรงกับเซิร์ฟเวอร์ของคุณก่อนรันบอท
-const ADMIN_ROLE_ID      = '1512646616321097818'; // Role แอดมินที่รับออเดอร์ได้
-const TICKET_CATEGORY_ID = '1551990531113099335'; // Category สำหรับสร้างห้องออเดอร์
+const ADMIN_ROLE_ID      = '1512646616321097818'; // Role แอดมินที่รับออเดอร์/เรื่องสอบถามได้
+const TICKET_CATEGORY_ID = '1551990531113099335'; // Category สำหรับสร้างห้องออเดอร์ + ห้องสอบถาม
 const DONE_CATEGORY_ID   = '1551991162724683827'; // Category ที่ย้ายห้องไปเก็บหลังจบงาน
 const REVIEW_CHANNEL_ID  = '1551991014854762638'; // ห้องรีวิว
 
@@ -35,21 +35,12 @@ const QUEUE_FILE  = './queue.txt';
 const TICKET_FILE = './active_tickets.json';
 
 // ==========================================
-// [ 4. Packages Data ]
+// [ 4. Packages / Pricing Data ]
 // ==========================================
-// ตารางแพ็กเกจโรบัค (ตั้งราคาเป็น 0 ไว้ก่อนตามที่สั่ง — แก้ราคาได้ด้วยคำสั่ง !setrobuxprice)
-let ROBUX_PACKAGES = [
-    { id: 'ro_40',    ro: 40,    price: 0 },
-    { id: 'ro_80',    ro: 80,    price: 0 },
-    { id: 'ro_400',   ro: 400,   price: 0 },
-    { id: 'ro_800',   ro: 800,   price: 0 },
-    { id: 'ro_1200',  ro: 1200,  price: 0 },
-    { id: 'ro_1700',  ro: 1700,  price: 0 },
-    { id: 'ro_3150',  ro: 3150,  price: 0 },
-    { id: 'ro_4500',  ro: 4500,  price: 0 },
-    { id: 'ro_10000', ro: 10000, price: 0 },
-    { id: 'ro_22500', ro: 22500, price: 0 }
-];
+// จำกัดช่วงยอดเติม TrueMoney Wallet — ยอดชำระ = ยอดที่เติมตรงๆ 1:1 (ไม่มีส่วนลด/บวกเพิ่ม)
+// เงื่อนไขราคาพิเศษใดๆ ให้แอดมินคุยกับลูกค้าเองในห้อง บอททำหน้าที่แค่สร้างห้อง + QR + อ่านสลิป
+const MIN_TRUEMONEY_AMOUNT = 20;
+const MAX_TRUEMONEY_AMOUNT = 10000;
 
 // แพ็กเกจ Discord Nitro
 let NITRO_PACKAGES = [
@@ -62,7 +53,7 @@ let NITRO_PACKAGES = [
 // ==========================================
 // [ 5. Runtime State ]
 // ==========================================
-let orderFlow        = {}; // orderFlow[userId] = { category: 'robux'|'nitro', pkg, username }
+let orderFlow        = {}; // orderFlow[userId] = { category: 'truemoney'|'nitro'|'inquiry', pkg/amount/phone/question }
 let activeTicketData = {};
 let queueCount        = 1;
 
@@ -84,27 +75,10 @@ function loadPersistentData() {
     if (fs.existsSync(QUEUE_FILE)) queueCount = parseInt(fs.readFileSync(QUEUE_FILE, 'utf8')) || 1;
 }
 
-function saveTickets() { fs.writeFileSync(TICKET_FILE, JSON.stringify(activeTicketData, null, 2)); }
-function saveQueue()   { fs.writeFileSync(QUEUE_FILE, queueCount.toString()); }
+function saveTickets()  { fs.writeFileSync(TICKET_FILE, JSON.stringify(activeTicketData, null, 2)); }
+function saveQueue()    { fs.writeFileSync(QUEUE_FILE, queueCount.toString()); }
 
 loadPersistentData();
-
-async function getRobloxPfp(username) {
-    try {
-        const userRes = await axios.post('https://users.roblox.com/v1/usernames/users', {
-            usernames: [username], excludeBannedUsers: true
-        });
-        if (!userRes.data.data.length) throw new Error('User not found');
-        const userId   = userRes.data.data[0].id;
-        const thumbRes = await axios.get(
-            `https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${userId}&size=420x420&format=Png&isCircular=false`
-        );
-        return { pfp: thumbRes.data.data[0].imageUrl, valid: true, userId };
-    } catch (err) {
-        console.error('❌ Roblox API Error:', err.message);
-        return { pfp: 'https://tr.rbxcdn.com/38c6ed8c63333055ae701358385392e2/420/420/AvatarHeadshot/Png', valid: false, userId: null };
-    }
-}
 
 /** ลิงก์รูป QR Code พร้อมเพย์ตามยอดเงิน (PromptPay.io) */
 function buildQrUrl(amount) {
@@ -191,13 +165,14 @@ const client = new Client({
 client.on('messageCreate', async (message) => {
     if (!message.guild || message.author.bot) return;
 
-    // ── ตรวจจับ + ตรวจสอบสลิปอัตโนมัติในห้อง Ticket ─────────────
+    // ── ตรวจจับ + ตรวจสอบสลิปอัตโนมัติในห้อง Ticket (เฉพาะห้องที่ต้องชำระเงิน) ──
     const ticketData = activeTicketData[message.channel.id];
     if (ticketData && message.channel.parentId === TICKET_CATEGORY_ID) {
-        const isAdmin = message.member.roles.cache.has(ADMIN_ROLE_ID);
-        const image   = message.attachments.find(a => (a.contentType || '').startsWith('image/'));
+        const isAdmin   = message.member.roles.cache.has(ADMIN_ROLE_ID);
+        const isPayment = ticketData.category !== 'inquiry'; // ห้องสอบถามไม่ต้องเช็คสลิป
+        const image     = message.attachments.find(a => (a.contentType || '').startsWith('image/'));
 
-        if (!isAdmin && image && !ticketData.slipVerified) {
+        if (isPayment && !isAdmin && image && !ticketData.slipVerified) {
             const checkingMsg = await message.reply('🔍 กำลังตรวจสอบสลิป กรุณารอสักครู่นะครับ...');
 
             const result = await verifySlip(image.url, ticketData.price);
@@ -243,7 +218,7 @@ client.on('messageCreate', async (message) => {
     const args    = message.content.trim().split(/ +/);
     const command = args[0].toLowerCase();
 
-    const ADMIN_COMMANDS = ['!setupshop', '!setrobuxprice', '!setnitroprice'];
+    const ADMIN_COMMANDS = ['!setupshop', '!setnitroprice'];
     if (!ADMIN_COMMANDS.includes(command)) return;
 
     // แจ้งเตือนชัดเจนแทนการเงียบ เผื่อ role ไม่ตรง จะได้รู้ทันทีว่าปัญหาคืออะไร
@@ -257,12 +232,13 @@ client.on('messageCreate', async (message) => {
             .setAuthor({ name: '🛒 SHOP', iconURL: client.user.displayAvatarURL() })
             .setTitle('🛍️ ยินดีต้อนรับสู่ร้านค้า')
             .setDescription(
-`╭━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╮
-✨ **เลือกบริการที่ต้องการเติมด้านล่างนี้ครับ**
-╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯
+`╭━━━━━━━━━━━━━━━━━━━━━━╮
+✨ **เลือกบริการที่ต้องการด้านล่างนี้ครับ**
+╰━━━━━━━━━━━━━━━━━━━━━━╯
 
-💎 **เติมโรบัค (Robux)**
+💸 **เติมเงิน TrueMoney Wallet**
 🚀 **เติมดิสคอร์ดไนโตร (Nitro)**
+❓ **สอบถามข้อมูล / ติดต่อแอดมิน**
 
 💡 กดปุ่มเพื่อเริ่มใช้งานทันที`
             )
@@ -270,24 +246,12 @@ client.on('messageCreate', async (message) => {
             .setFooter({ text: 'ระบบร้านค้าอัตโนมัติ' });
 
         const buttons = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId('start_robux').setLabel('เติมโรบัค').setEmoji('💎').setStyle(ButtonStyle.Success),
-            new ButtonBuilder().setCustomId('start_nitro').setLabel('เติมไนโตร').setEmoji('🚀').setStyle(ButtonStyle.Primary)
+            new ButtonBuilder().setCustomId('start_truemoney').setLabel('เติมทรูมันนี่').setEmoji('💸').setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId('start_nitro').setLabel('เติมไนโตร').setEmoji('🚀').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId('start_inquiry').setLabel('สอบถาม').setEmoji('❓').setStyle(ButtonStyle.Secondary)
         );
 
         return message.channel.send({ embeds: [embed], components: [buttons] });
-    }
-
-    // !setrobuxprice [ro] [price]  → ตั้งราคาแพ็กเกจโรบัค
-    if (command === '!setrobuxprice') {
-        const ro    = parseInt(args[1]);
-        const price = parseFloat(args[2]);
-        const pkg   = ROBUX_PACKAGES.find(p => p.ro === ro);
-
-        if (!pkg || isNaN(price) || price < 0)
-            return message.reply('❌ รูปแบบไม่ถูกต้อง\nรูปแบบ: `!setrobuxprice [จำนวนro] [ราคาบาท]`\nตัวอย่าง: `!setrobuxprice 400 79`');
-
-        pkg.price = price;
-        return message.reply(`✅ ตั้งราคา **${pkg.ro.toLocaleString()} Robux** เป็น **${price} บาท** แล้วครับ`);
     }
 
     // !setnitroprice [id] [price]  → ตั้งราคาแพ็กเกจไนโตร
@@ -307,11 +271,11 @@ client.on('messageCreate', async (message) => {
 // ════════════════════════════════════════════════════════════
 //  ORDER FLOW
 //
-//  Step 1 ► start_robux / start_nitro  → เลือกแพ็กเกจจากเมนู
-//  Step 2 ► sel_robux_pkg              → เปิด modal ถามชื่อ Roblox
-//           sel_nitro_pkg              → ไปสรุปออเดอร์ทันที (ไม่ต้องกรอกชื่อ)
-//  Step 3 ► modal_robux_submit         → สรุปออเดอร์ + ปุ่มยืนยัน/ยกเลิก
-//  Step 4 ► flow_confirm               → สร้างห้องชำระเงิน + QR พร้อมเพย์
+//  Step 1 ► start_truemoney / start_nitro / start_inquiry → เปิด modal
+//  Step 2 ► modal_truemoney_submit  → สรุปออเดอร์ + ปุ่มยืนยัน/ยกเลิก
+//           sel_nitro_pkg           → สรุปออเดอร์ทันที
+//           modal_inquiry_submit    → สร้างห้องสอบถามทันที (ไม่มีขั้นตอนชำระเงิน)
+//  Step 3 ► flow_confirm            → สร้างห้องชำระเงิน + QR พร้อมเพย์ (truemoney/nitro)
 //
 //  ADMIN: btn_work → btn_done  |  btn_cancel
 // ════════════════════════════════════════════════════════════
@@ -319,33 +283,35 @@ client.on('messageCreate', async (message) => {
 client.on('interactionCreate', async (interaction) => {
     try {
         // ─────────────────────────────────────────────────────────
-        //  STEP 1  start_robux → เมนูเลือกแพ็กเกจโรบัค
+        //  STEP 1  start_truemoney → เปิด modal กรอกเบอร์ + จำนวนเงิน
         // ─────────────────────────────────────────────────────────
-        if (interaction.isButton() && interaction.customId === 'start_robux') {
-            orderFlow[interaction.user.id] = { category: 'robux' };
+        if (interaction.isButton() && interaction.customId === 'start_truemoney') {
+            orderFlow[interaction.user.id] = { category: 'truemoney' };
 
-            const selectMenu = new StringSelectMenuBuilder()
-                .setCustomId('sel_robux_pkg')
-                .setPlaceholder('เลือกแพ็กเกจโรบัคที่ต้องการ...')
-                .setMinValues(1)
-                .setMaxValues(1);
+            const modal = new ModalBuilder()
+                .setCustomId('modal_truemoney_submit')
+                .setTitle('💸 เติมเงิน TrueMoney Wallet');
 
-            ROBUX_PACKAGES.forEach(pkg => {
-                selectMenu.addOptions({
-                    label:       `${pkg.ro.toLocaleString()} Robux`,
-                    description: `ราคา: ${pkg.price.toLocaleString()} บาท`,
-                    value:       pkg.id,
-                    emoji:       '💎'
-                });
-            });
+            modal.addComponents(
+                new ActionRowBuilder().addComponents(
+                    new TextInputBuilder()
+                        .setCustomId('phone_input')
+                        .setLabel('เบอร์ที่ผูกกับ TrueMoney Wallet')
+                        .setStyle(TextInputStyle.Short)
+                        .setPlaceholder('เช่น 0812345678')
+                        .setRequired(true)
+                ),
+                new ActionRowBuilder().addComponents(
+                    new TextInputBuilder()
+                        .setCustomId('amount_input')
+                        .setLabel(`จำนวนเงินที่ต้องการเติม (บาท) ${MIN_TRUEMONEY_AMOUNT}-${MAX_TRUEMONEY_AMOUNT}`)
+                        .setStyle(TextInputStyle.Short)
+                        .setPlaceholder('เช่น 100')
+                        .setRequired(true)
+                )
+            );
 
-            const embed = new EmbedBuilder()
-                .setTitle('💎 เลือกแพ็กเกจโรบัค')
-                .setColor('#00B2FF')
-                .setDescription('กรุณาเลือกจำนวนโรบัคที่ต้องการเติมจากเมนูด้านล่างนี้ครับ');
-
-            const row = new ActionRowBuilder().addComponents(selectMenu);
-            return interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
+            return interaction.showModal(modal);
         }
 
         // ─────────────────────────────────────────────────────────
@@ -378,6 +344,29 @@ client.on('interactionCreate', async (interaction) => {
             return interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
         }
 
+        // ─────────────────────────────────────────────────────────
+        //  STEP 1  start_inquiry → เปิด modal กรอกคำถาม
+        // ─────────────────────────────────────────────────────────
+        if (interaction.isButton() && interaction.customId === 'start_inquiry') {
+            const modal = new ModalBuilder()
+                .setCustomId('modal_inquiry_submit')
+                .setTitle('❓ สอบถามข้อมูล / ติดต่อแอดมิน');
+
+            modal.addComponents(
+                new ActionRowBuilder().addComponents(
+                    new TextInputBuilder()
+                        .setCustomId('question_input')
+                        .setLabel('คำถาม / เรื่องที่ต้องการสอบถาม')
+                        .setStyle(TextInputStyle.Paragraph)
+                        .setPlaceholder('พิมพ์รายละเอียดที่ต้องการสอบถามได้เลยครับ')
+                        .setRequired(true)
+                        .setMaxLength(1000)
+                )
+            );
+
+            return interaction.showModal(modal);
+        }
+
         // ── ยกเลิกออเดอร์ ────────────────────────────────────────
         if (interaction.isButton() && interaction.customId === 'cancel_order') {
             delete orderFlow[interaction.user.id];
@@ -385,31 +374,40 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         // ─────────────────────────────────────────────────────────
-        //  STEP 2 (Robux)  เลือกแพ็กเกจ → เปิด modal ถามชื่อ Roblox
+        //  STEP 2 (TrueMoney)  กรอกเบอร์+จำนวนเงินเสร็จ → สรุปออเดอร์
         // ─────────────────────────────────────────────────────────
-        if (interaction.isStringSelectMenu() && interaction.customId === 'sel_robux_pkg') {
-            const pkg  = ROBUX_PACKAGES.find(p => p.id === interaction.values[0]);
+        if (interaction.isModalSubmit() && interaction.customId === 'modal_truemoney_submit') {
             const flow = orderFlow[interaction.user.id];
-            if (!pkg || !flow) return interaction.reply({ content: '❌ ไม่พบออเดอร์ กรุณาเริ่มใหม่', ephemeral: true });
+            if (!flow) return interaction.reply({ content: '❌ ไม่พบออเดอร์ กรุณาเริ่มใหม่', ephemeral: true });
 
-            flow.pkg = pkg;
+            const phone  = interaction.fields.getTextInputValue('phone_input').trim();
+            const amount = parseInt(interaction.fields.getTextInputValue('amount_input').replace(/[^0-9]/g, ''));
 
-            const modal = new ModalBuilder()
-                .setCustomId('modal_robux_submit')
-                .setTitle('🎮 ระบุชื่อผู้ใช้ Roblox');
+            if (!/^0[0-9]{9}$/.test(phone))
+                return interaction.reply({ content: '❌ เบอร์โทรศัพท์ไม่ถูกต้อง กรุณากรอกเบอร์ 10 หลัก เช่น 0812345678', ephemeral: true });
 
-            modal.addComponents(
-                new ActionRowBuilder().addComponents(
-                    new TextInputBuilder()
-                        .setCustomId('username_input')
-                        .setLabel('ชื่อผู้ใช้ Roblox (Username)')
-                        .setStyle(TextInputStyle.Short)
-                        .setPlaceholder('เช่น PlayerXYZ (ระบุให้ถูกต้อง)')
-                        .setRequired(true)
-                )
+            if (isNaN(amount) || amount < MIN_TRUEMONEY_AMOUNT || amount > MAX_TRUEMONEY_AMOUNT)
+                return interaction.reply({ content: `❌ จำนวนเงินต้องอยู่ระหว่าง ${MIN_TRUEMONEY_AMOUNT.toLocaleString()}-${MAX_TRUEMONEY_AMOUNT.toLocaleString()} บาท`, ephemeral: true });
+
+            flow.phone  = phone;
+            flow.amount = amount;
+            flow.price  = amount;
+
+            const embed = new EmbedBuilder()
+                .setTitle('🧾 สรุปการเติม TrueMoney Wallet')
+                .setColor('#F1C40F')
+                .setDescription('กรุณาตรวจสอบข้อมูลก่อนกดยืนยันเพื่อไปหน้าชำระเงินครับ')
+                .addFields(
+                    { name: '📱 เบอร์ TrueMoney', value: `\`${flow.phone}\``, inline: true },
+                    { name: '💰 ยอดชำระ', value: `**${flow.price.toLocaleString()} บาท**`, inline: false }
+                );
+
+            const row = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId('flow_confirm').setLabel('✅ ยืนยันเพื่อชำระเงิน').setStyle(ButtonStyle.Success),
+                new ButtonBuilder().setCustomId('cancel_order').setLabel('❌ ยกเลิก').setStyle(ButtonStyle.Danger)
             );
 
-            return interaction.showModal(modal);
+            return interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
         }
 
         // ─────────────────────────────────────────────────────────
@@ -420,7 +418,8 @@ client.on('interactionCreate', async (interaction) => {
             const flow = orderFlow[interaction.user.id];
             if (!pkg || !flow) return interaction.reply({ content: '❌ ไม่พบออเดอร์ กรุณาเริ่มใหม่', ephemeral: true });
 
-            flow.pkg = pkg;
+            flow.pkg   = pkg;
+            flow.price = pkg.price;
 
             const embed = new EmbedBuilder()
                 .setTitle('🧾 สรุปการสั่งซื้อ Nitro')
@@ -440,54 +439,65 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         // ─────────────────────────────────────────────────────────
-        //  STEP 3 (Robux)  กรอกชื่อเสร็จ → สรุปออเดอร์
+        //  STEP 2 (Inquiry)  กรอกคำถามเสร็จ → สร้างห้องสอบถามทันที
         // ─────────────────────────────────────────────────────────
-        if (interaction.isModalSubmit() && interaction.customId === 'modal_robux_submit') {
-            const flow = orderFlow[interaction.user.id];
-            if (!flow || !flow.pkg) return interaction.reply({ content: '❌ ไม่พบออเดอร์ กรุณาเริ่มใหม่', ephemeral: true });
-
-            flow.username = interaction.fields.getTextInputValue('username_input').trim();
-
-            const embed = new EmbedBuilder()
-                .setTitle('🧾 สรุปการสั่งซื้อโรบัค')
-                .setColor('#F1C40F')
-                .setDescription('กรุณาตรวจสอบข้อมูลก่อนกดยืนยันเพื่อไปหน้าชำระเงินครับ')
-                .addFields(
-                    { name: '🎮 Username', value: `\`${flow.username}\``, inline: true },
-                    { name: '💎 จำนวนโรบัค', value: `**${flow.pkg.ro.toLocaleString()}** R$`, inline: true },
-                    { name: '💰 ยอดชำระ', value: `**${flow.pkg.price.toLocaleString()} บาท**`, inline: false }
-                );
-
-            const row = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId('flow_confirm').setLabel('✅ ยืนยันเพื่อชำระเงิน').setStyle(ButtonStyle.Success),
-                new ButtonBuilder().setCustomId('cancel_order').setLabel('❌ ยกเลิก').setStyle(ButtonStyle.Danger)
-            );
-
-            return interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
-        }
-
-        // ─────────────────────────────────────────────────────────
-        //  STEP 4  flow_confirm → สร้างห้องชำระเงิน + QR พร้อมเพย์
-        // ─────────────────────────────────────────────────────────
-        if (interaction.isButton() && interaction.customId === 'flow_confirm') {
-            const flow = orderFlow[interaction.user.id];
-            if (!flow || !flow.pkg) return interaction.reply({ content: '❌ หมดเวลาทำรายการ กรุณาเริ่มใหม่', ephemeral: true });
+        if (interaction.isModalSubmit() && interaction.customId === 'modal_inquiry_submit') {
+            const question = interaction.fields.getTextInputValue('question_input').trim();
 
             await interaction.deferReply({ ephemeral: true });
 
-            const isRobux = flow.category === 'robux';
-            let pfp = null;
+            const channel = await interaction.guild.channels.create({
+                name:   `ถาม-${queueCount}`,
+                parent: TICKET_CATEGORY_ID,
+                permissionOverwrites: [
+                    { id: interaction.guild.id, deny:  [PermissionFlagsBits.ViewChannel] },
+                    { id: interaction.user.id,  allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.AttachFiles] },
+                    { id: ADMIN_ROLE_ID,         allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] }
+                ]
+            });
 
-            if (isRobux) {
-                const res = await getRobloxPfp(flow.username);
-                if (!res.valid) {
-                    return interaction.editReply({ content: `❌ ไม่พบผู้ใช้ Roblox ชื่อ **${flow.username}** กรุณาตรวจสอบชื่อแล้วลองใหม่ครับ` });
-                }
-                pfp = res.pfp;
-            }
+            activeTicketData[channel.id] = {
+                category: 'inquiry',
+                question,
+                price:    0,
+                userId:   interaction.user.id,
+                qNum:     queueCount,
+                slipReceived: false,
+                slipVerified: false
+            };
+            saveTickets();
+
+            const embed = new EmbedBuilder()
+                .setTitle(`❓ เรื่องสอบถาม (คิวที่ ${queueCount})`)
+                .setColor('#5865F2')
+                .setDescription(`สวัสดีครับ <@${interaction.user.id}>\n\n**คำถาม:**\n${question}\n\nรอแอดมินเข้ามาตอบกลับสักครู่นะครับ`);
+
+            const btns = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId('btn_work').setLabel('รับเรื่อง').setEmoji('🛠️').setStyle(ButtonStyle.Primary),
+                new ButtonBuilder().setCustomId('btn_done').setLabel('ปิดห้อง').setEmoji('✅').setStyle(ButtonStyle.Success)
+            );
+
+            await channel.send({ content: `🔔 <@&${ADMIN_ROLE_ID}>`, embeds: [embed], components: [btns] });
+
+            queueCount++;
+            saveQueue();
+
+            return interaction.editReply({ content: `✅ ส่งคำถามเรียบร้อยแล้ว! แตะที่นี่เพื่อดูคำตอบ 👉 ${channel}` });
+        }
+
+        // ─────────────────────────────────────────────────────────
+        //  STEP 3  flow_confirm → สร้างห้องชำระเงิน + QR พร้อมเพย์
+        // ─────────────────────────────────────────────────────────
+        if (interaction.isButton() && interaction.customId === 'flow_confirm') {
+            const flow = orderFlow[interaction.user.id];
+            if (!flow || !flow.price) return interaction.reply({ content: '❌ หมดเวลาทำรายการ กรุณาเริ่มใหม่', ephemeral: true });
+
+            await interaction.deferReply({ ephemeral: true });
+
+            const isTrueMoney = flow.category === 'truemoney';
 
             const channel = await interaction.guild.channels.create({
-                name:   isRobux ? `คิว-โรบัค-${queueCount}` : `คิว-ไนโตร-${queueCount}`,
+                name:   isTrueMoney ? `คิว-ทรูมันนี่-${queueCount}` : `คิว-ไนโตร-${queueCount}`,
                 parent: TICKET_CATEGORY_ID,
                 permissionOverwrites: [
                     { id: interaction.guild.id, deny:  [PermissionFlagsBits.ViewChannel] },
@@ -498,19 +508,18 @@ client.on('interactionCreate', async (interaction) => {
 
             activeTicketData[channel.id] = {
                 category: flow.category,
-                username: flow.username ?? null,
-                label:    isRobux ? `${flow.pkg.ro.toLocaleString()} Robux` : flow.pkg.label,
-                amount:   isRobux ? flow.pkg.ro : null,
-                price:    flow.pkg.price,
+                phone:    isTrueMoney ? flow.phone : null,
+                label:    isTrueMoney ? `เติม TrueMoney ${flow.amount.toLocaleString()} บาท` : flow.pkg.label,
+                amount:   isTrueMoney ? flow.amount : null,
+                price:    flow.price,
                 userId:   interaction.user.id,
-                pfp,
                 qNum:     queueCount,
                 slipReceived: false,
                 slipVerified: false
             };
             saveTickets();
 
-            const qrUrl = buildQrUrl(flow.pkg.price);
+            const qrUrl = buildQrUrl(flow.price);
 
             const embed = new EmbedBuilder()
                 .setTitle(`🧾 หน้าชำระเงิน (คิวที่ ${queueCount})`)
@@ -519,18 +528,16 @@ client.on('interactionCreate', async (interaction) => {
 `สวัสดีครับ <@${interaction.user.id}>
 
 **ข้อมูลออเดอร์:**
-${isRobux ? `🎮 Username: \`${flow.username}\`\n💎 จำนวนที่เติม: **${flow.pkg.ro.toLocaleString()} Robux**` : `🚀 แพ็กเกจ: **${flow.pkg.label}**`}
-💰 ยอดชำระ: **${flow.pkg.price.toLocaleString()} บาท**
+${isTrueMoney ? `📱 เบอร์ TrueMoney: \`${flow.phone}\`` : `🚀 แพ็กเกจ: **${flow.pkg.label}**`}
+💰 ยอดชำระ: **${flow.price.toLocaleString()} บาท**
 
 📌 **วิธีชำระเงิน:**
 สแกน QR พร้อมเพย์ด้านล่างนี้ หรือโอนมาที่เบอร์: \`${PROMPTPAY_NUMBER}\`
 
 📸 **เมื่อโอนเสร็จแล้ว ให้ส่งรูปสลิปลงในห้องนี้ได้เลยครับ!**`
                 )
-                .setImage(qrUrl);
-
-            if (pfp) embed.setThumbnail(pfp);
-            embed.setFooter({ text: 'เมื่อส่งสลิปแล้ว บอทจะตอบกลับอัตโนมัติ' });
+                .setImage(qrUrl)
+                .setFooter({ text: 'เมื่อส่งสลิปแล้ว บอทจะตรวจสอบและตอบกลับอัตโนมัติ' });
 
             const btns = new ActionRowBuilder().addComponents(
                 new ButtonBuilder().setCustomId('btn_work').setLabel('แอดมินรับงาน').setEmoji('🛠️').setStyle(ButtonStyle.Primary),
@@ -556,7 +563,11 @@ ${isRobux ? `🎮 Username: \`${flow.username}\`\n💎 จำนวนที่�
             const data = activeTicketData[interaction.channel.id];
             if (!data) return;
 
-            await interaction.reply({ content: `👨‍💻 <@${interaction.user.id}> ได้เข้ามารับงานแล้ว! กำลังตรวจสอบสลิปและดำเนินการให้ครับ <@${data.userId}>` });
+            const text = data.category === 'inquiry'
+                ? `👨‍💻 <@${interaction.user.id}> รับเรื่องสอบถามแล้ว กำลังตอบกลับให้ครับ <@${data.userId}>`
+                : `👨‍💻 <@${interaction.user.id}> ได้เข้ามารับงานแล้ว! กำลังตรวจสอบสลิปและดำเนินการให้ครับ <@${data.userId}>`;
+
+            await interaction.reply({ content: text });
             return interaction.channel.setName(`🛠️-รับงาน-${data.qNum}`).catch(() => {});
         }
 
@@ -565,15 +576,18 @@ ${isRobux ? `🎮 Username: \`${flow.username}\`\n💎 จำนวนที่�
             const data = activeTicketData[interaction.channel.id];
             if (!data) return;
 
-            const doneText = data.category === 'robux'
-                ? `✅ <@${data.userId}> ได้รับโรบัค **${data.amount.toLocaleString()} R$** เรียบร้อยแล้ว!`
-                : `✅ <@${data.userId}> ได้รับ **${data.label}** เรียบร้อยแล้ว!`;
+            let doneText;
+            if (data.category === 'inquiry') {
+                doneText = `✅ เรื่องสอบถามของ <@${data.userId}> ได้รับการตอบกลับและปิดห้องแล้วครับ`;
+            } else if (data.category === 'truemoney') {
+                doneText = `✅ <@${data.userId}> ได้รับเงินเข้า TrueMoney Wallet **${data.amount.toLocaleString()} บาท** เรียบร้อยแล้ว!`;
+            } else {
+                doneText = `✅ <@${data.userId}> ได้รับ **${data.label}** เรียบร้อยแล้ว!`;
+            }
 
             const completionEmbed = new EmbedBuilder()
                 .setColor('#2ECC71').setTitle('🎉 ทำรายการเสร็จสิ้นแล้ว')
                 .setDescription(`${doneText}\n\n💖 ขอบคุณที่ใช้บริการครับ ฝากรีวิวได้ที่ <#${REVIEW_CHANNEL_ID}>`);
-
-            if (data.pfp) completionEmbed.setThumbnail(data.pfp);
 
             await interaction.message.edit({ components: [] }).catch(() => {});
             await interaction.reply({ content: `<@${data.userId}>`, embeds: [completionEmbed] });
