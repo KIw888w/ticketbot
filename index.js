@@ -11,7 +11,7 @@ process.on('uncaughtException',  (err)    => { console.error('💥 Uncaught Exce
 // ==========================================
 const {
     Client, GatewayIntentBits, ActionRowBuilder, EmbedBuilder,
-    PermissionFlagsBits, ButtonBuilder, ButtonStyle
+    PermissionFlagsBits, ButtonBuilder, ButtonStyle, Events
 } = require('discord.js');
 
 const fs    = require('fs');
@@ -22,7 +22,7 @@ const axios = require('axios');
 // ==========================================
 // ⚠️ แก้ไอดีเหล่านี้ให้ตรงกับเซิร์ฟเวอร์ของคุณก่อนรันบอท
 const ADMIN_ROLE_ID          = '1555146265958944878'; // Role แอดมินที่รับตั๋ว/สร้าง QR ได้
-const TICKET_CATEGORY_ID     = '1554881839422906496'; // Category สำหรับสร้างห้องตั๋ว
+const TICKET_CATEGORY_ID     = '1554881839422906495'; // Category สำหรับสร้างห้องตั๋ว
 const DONE_CATEGORY_ID       = '1554881839745994884'; // Category ที่ย้ายห้องไปเก็บหลังปิดตั๋ว
 const REVIEW_CHANNEL_ID      = '1554881839745994883'; // ห้องรีวิว (เอาไว้นับจำนวน)
 const SLIP_NOTIFY_CHANNEL_ID = '1555145911879864380'; // ห้องแจ้งเตือนเมื่อตรวจสอบสลิปผ่านแล้ว
@@ -157,13 +157,62 @@ function buildReviewChannelName(currentName, count) {
     return `${currentName}〔${count}〕`;
 }
 
-async function closeTicket(channelId, userId) {
-    const chan = client.channels.cache.get(channelId);
-    if (!chan) return;
-    await chan.setParent(DONE_CATEGORY_ID, { lockPermissions: false }).catch(() => {});
-    if (userId) await chan.permissionOverwrites.edit(userId, { ViewChannel: false }).catch(() => {});
+// ── ปิดตั๋ว: รอ 10 นาที แล้วย้ายเข้าหมวดเก็บงาน + ซ่อนห้องจากลูกค้า ──
+const CLOSE_DELAY_MS = 10 * 60 * 1000;
+const closeTimers    = new Map(); // channelId -> timeout
+
+function scheduleClose(channelId, delayMs) {
+    if (closeTimers.has(channelId)) return;
+    const timer = setTimeout(() => {
+        closeTimers.delete(channelId);
+        closeTicket(channelId);
+    }, Math.max(0, delayMs));
+    closeTimers.set(channelId, timer);
+}
+
+async function closeTicket(channelId) {
+    const data   = activeTicketData[channelId];
+    const userId = data?.userId;
+
+    try {
+        const chan = await client.channels.fetch(channelId);
+        await chan.setParent(DONE_CATEGORY_ID, { lockPermissions: false });
+        if (userId) await chan.permissionOverwrites.edit(userId, { ViewChannel: false });
+        console.log(`📦 ตั๋ว #${data?.qNum ?? '?'} ย้ายเข้าหมวดเก็บงานและซ่อนจากลูกค้าแล้ว`);
+    } catch (err) {
+        if (err.code !== 10003) { // 10003 = Unknown Channel (ห้องถูกลบไปแล้ว ก็ถือว่าเสร็จ)
+            console.error(`❌ ย้าย/ซ่อนตั๋ว ${channelId} ไม่สำเร็จ (เช็ค DONE_CATEGORY_ID, สิทธิ์ Manage Channels, หมวดเต็ม 50 ห้อง):`, err.message);
+            return; // เก็บข้อมูลไว้ จะลองใหม่ตอนบอทเริ่มรันครั้งถัดไป
+        }
+    }
+
     delete activeTicketData[channelId];
     saveTickets();
+}
+
+// ── เปลี่ยนชื่อห้องรีวิว: Discord จำกัดการเปลี่ยนชื่อห้อง 2 ครั้ง/10 นาที
+//    จึงรวมการเปลี่ยนไว้ทีละครั้ง (เว้นอย่างน้อย 5 นาที) แล้วใช้เลขล่าสุดเสมอ ──
+const REVIEW_RENAME_COOLDOWN = 5 * 60 * 1000;
+let lastReviewRename  = 0;
+let reviewRenameTimer = null;
+
+function scheduleReviewRename() {
+    if (reviewRenameTimer) return; // มีคิวรออยู่แล้ว ตอนยิงจะใช้เลขล่าสุดเอง
+    const wait = Math.max(0, lastReviewRename + REVIEW_RENAME_COOLDOWN - Date.now());
+    reviewRenameTimer = setTimeout(async () => {
+        reviewRenameTimer = null;
+        lastReviewRename  = Date.now();
+        try {
+            const ch      = await client.channels.fetch(REVIEW_CHANNEL_ID);
+            const newName = buildReviewChannelName(ch.name, reviewCount);
+            if (newName !== ch.name) {
+                await ch.setName(newName);
+                console.log(`✏️ เปลี่ยนชื่อห้องรีวิวเป็น ${newName}`);
+            }
+        } catch (err) {
+            console.error('❌ เปลี่ยนชื่อห้องรีวิวไม่ได้ (เช็ค REVIEW_CHANNEL_ID และสิทธิ์ Manage Channels ของบอท):', err.message);
+        }
+    }, wait);
 }
 
 // ==========================================
@@ -173,11 +222,46 @@ const client = new Client({
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 });
 
+client.once(Events.ClientReady, async () => {
+    console.log(`✅ ล็อกอินแล้ว: ${client.user.tag}`);
+
+    // กู้ตัวจับเวลาปิดตั๋วที่ค้างอยู่ (เผื่อบอทรีสตาร์ทระหว่างรอ 10 นาที)
+    for (const [channelId, data] of Object.entries(activeTicketData)) {
+        if (data.closeAt) scheduleClose(channelId, data.closeAt - Date.now());
+    }
+
+    // ซิงค์เลขรีวิวจากชื่อห้อง (กันนับใหม่จาก 0 ทับเลขเดิม) + ตรวจว่าบอทเข้าถึงห้องรีวิวได้
+    try {
+        const ch = await client.channels.fetch(REVIEW_CHANNEL_ID);
+        const m  = ch.name.match(/〔(\d+)〕/);
+        if (m && parseInt(m[1], 10) > reviewCount) {
+            reviewCount = parseInt(m[1], 10);
+            saveReviewCount();
+        }
+        console.log(`⭐ ห้องรีวิว: ${ch.name} | เลขที่นับอยู่: ${reviewCount}`);
+    } catch (err) {
+        console.error('❌ บอทเข้าถึงห้องรีวิวไม่ได้ — เช็ค REVIEW_CHANNEL_ID ว่าถูกเซิร์ฟเวอร์ และบอทเห็นห้องนี้:', err.message);
+    }
+});
+
 // ==========================================
 // [ 7. Message Handler: คำสั่งแอดมิน + ตรวจจับสลิป + นับรีวิว ]
 // ==========================================
 client.on('messageCreate', async (message) => {
     if (!message.guild || message.author.bot) return;
+
+    // ── ระบบนับรีวิว (เช็คก่อนคำสั่ง เพื่อให้รีวิวที่ขึ้นต้นด้วย ! ก็นับ) ──
+    if (message.channel.id === REVIEW_CHANNEL_ID) {
+        if (message.member?.roles.cache.has(ADMIN_ROLE_ID)) {
+            console.log('ℹ️ ข้อความของแอดมินในห้องรีวิว — ไม่นับ');
+        } else {
+            reviewCount++;
+            saveReviewCount();
+            console.log(`⭐ นับรีวิวใหม่ → ${reviewCount}`);
+            scheduleReviewRename();
+            return;
+        }
+    }
 
     // ── คำสั่งแอดมิน (เช็คก่อนเสมอ แม้จะพิมพ์ในห้องตั๋วก็ใช้ได้) ──────
     if (message.content.startsWith('!')) {
@@ -262,23 +346,6 @@ client.on('messageCreate', async (message) => {
             return message.reply(`✅ สร้าง QR ยอด **${amount.toLocaleString()} บาท** ส่งไปที่ ${targetChannel} แล้วครับ`);
         }
 
-        return;
-    }
-
-    // ── ระบบนับรีวิว ─────────────────────────────────────────────
-    if (message.channel.id === REVIEW_CHANNEL_ID) {
-        const isAdmin = message.member?.roles.cache.has(ADMIN_ROLE_ID);
-        if (!isAdmin) {
-            reviewCount++;
-            saveReviewCount();
-
-            const newName = buildReviewChannelName(message.channel.name, reviewCount);
-            if (newName !== message.channel.name) {
-                await message.channel.setName(newName).catch(err => {
-                    console.error('⚠️ เปลี่ยนชื่อห้องรีวิวไม่ได้ (อาจติด rate limit ของ Discord):', err.message);
-                });
-            }
-        }
         return;
     }
 
@@ -423,15 +490,22 @@ client.on('interactionCreate', async (interaction) => {
             if (!isAdmin && interaction.user.id !== data.userId)
                 return interaction.reply({ content: '❌ คุณไม่มีสิทธิ์ปิดห้องนี้ครับ', ephemeral: true });
 
+            if (data.closeAt)
+                return interaction.reply({ content: '⏳ ห้องนี้ถูกปิดไปแล้ว กำลังรอย้ายเข้าหมวดเก็บงานครับ', ephemeral: true });
+
+            // บันทึกเวลาปิดลงไฟล์ก่อน เผื่อบอทรีสตาร์ทระหว่างรอ แล้วตั้งเวลาย้าย+ซ่อน
+            data.closeAt = Date.now() + CLOSE_DELAY_MS;
+            saveTickets();
+            scheduleClose(interaction.channel.id, CLOSE_DELAY_MS);
+
             const embed = new EmbedBuilder()
                 .setColor('#2ECC71').setTitle('✅ ปิดห้องแล้ว')
-                .setDescription(`ห้องนี้ถูกปิดแล้วครับ\n\n💖 ขอบคุณที่ใช้บริการครับ ฝากรีวิวได้ที่ <#${REVIEW_CHANNEL_ID}>`);
+                .setDescription(`ห้องนี้ถูกปิดแล้วครับ ระบบจะย้ายและซ่อนห้องภายใน ${CLOSE_DELAY_MS / 60000} นาที\n\n💖 ขอบคุณที่ใช้บริการครับ ฝากรีวิวได้ที่ <#${REVIEW_CHANNEL_ID}>`);
 
             await interaction.message.edit({ components: [] }).catch(() => {});
             await interaction.reply({ embeds: [embed] });
-            await interaction.channel.setName(`✅-${data.qNum}`).catch(() => {});
-
-            setTimeout(() => closeTicket(interaction.channel.id, data.userId), 15 * 60 * 1000);
+            // ไม่ await: ถ้าติด rate limit ของการเปลี่ยนชื่อห้อง จะได้ไม่ขวางการย้ายห้อง
+            interaction.channel.setName(`✅-${data.qNum}`).catch(() => {});
             return;
         }
 
@@ -450,4 +524,4 @@ client.on('interactionCreate', async (interaction) => {
 // [ 8. Login ]
 // ==========================================
 // ⚠️ ห้ามเขียนโทเคนตรงๆ ในโค้ด — ใส่ไว้ในไฟล์ .env เป็น TOKEN=your_token_here
-client.login(process.env.TOKEN);
+client.login(process.env.DISCORDTOKEN || process.env.TOKEN);
