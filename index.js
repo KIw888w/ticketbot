@@ -28,7 +28,8 @@ const REVIEW_CHANNEL_ID      = '1554881839745994883'; // ห้องรีว�
 const SLIP_NOTIFY_CHANNEL_ID = '1555145911879864380'; // ห้องแจ้งเตือนเมื่อตรวจสอบสลิปผ่านแล้ว
 
 const PROMPTPAY_NUMBER = '0621473585'; // เบอร์พร้อมเพย์รับเงิน
-const EASYSLIP_API_KEY = process.env.EASYSLIP_API_KEY; // ⚠️ สมัครขอคีย์ที่ document.easyslip.com แล้วใส่ในไฟล์ .env
+const SLIPOK_API_KEY   = process.env.SLIPOK_API_KEY;   // ⚠️ API Key จากหน้า SlipOK (slipok.com) ใส่ในไฟล์ .env
+const SLIPOK_BRANCH_ID = process.env.SLIPOK_BRANCH_ID; // ⚠️ Branch ID (รหัสสาขา) จาก SlipOK ใส่ในไฟล์ .env
 
 const QUEUE_FILE        = './queue.txt';
 const TICKET_FILE       = './active_tickets.json';
@@ -88,63 +89,66 @@ function resolveChannelId(input) {
 }
 
 /**
- * ตรวจสอบสลิปโอนเงินจริงผ่าน EasySlip API (https://document.easyslip.com)
- * ใช้ endpoint ต่างกันตามช่องทางจ่าย: ธนาคาร/พร้อมเพย์ ใช้ /verify/bank, TrueMoney ใช้ /verify/truewallet
+ * ตรวจสอบสลิปโอนเงินจริงผ่าน SlipOK API (https://slipok.com)
+ * ส่ง URL รูปสลิปพร้อมยอดที่ต้องชำระ (amount) และเปิด log เพื่อให้ SlipOK ตรวจสลิปซ้ำให้
  * @returns {Promise<{ok:boolean, reason:string, data?:object}>}
  */
-async function verifySlip(imageUrl, expectedAmount, method = 'promptpay') {
-    if (!EASYSLIP_API_KEY) {
+async function verifySlip(imageUrl, expectedAmount) {
+    if (!SLIPOK_API_KEY || !SLIPOK_BRANCH_ID) {
         return { ok: false, reason: 'NO_API_KEY' };
     }
 
-    const endpoint = method === 'truemoney'
-        ? 'https://api.easyslip.com/v2/verify/truewallet'
-        : 'https://api.easyslip.com/v2/verify/bank';
+    const endpoint = `https://api.slipok.com/api/line/apikey/${SLIPOK_BRANCH_ID}`;
 
     try {
         const res = await axios.post(
             endpoint,
             {
                 url: imageUrl,
-                matchAmount: expectedAmount > 0 ? expectedAmount : undefined,
-                checkDuplicate: true
+                log: true,
+                ...(expectedAmount > 0 ? { amount: expectedAmount } : {})
             },
-            { headers: { Authorization: `Bearer ${EASYSLIP_API_KEY}` } }
+            { headers: { 'x-authorization': SLIPOK_API_KEY, 'Content-Type': 'application/json' } }
         );
 
         const body = res.data;
-        if (!body.success) {
-            return { ok: false, reason: body.error?.code || 'UNKNOWN_ERROR' };
+        if (!body?.success || !body.data) {
+            return { ok: false, reason: String(body?.code ?? 'UNKNOWN_ERROR') };
         }
 
         const slip = body.data;
-        if (slip.isDuplicate) {
-            return { ok: false, reason: 'DUPLICATE_SLIP', data: slip };
-        }
-        if (expectedAmount > 0 && slip.isAmountMatched === false) {
-            return { ok: false, reason: 'AMOUNT_MISMATCH', data: slip };
+        // เช็กยอดซ้ำอีกชั้น เผื่อ API ไม่ได้ตรวจให้
+        if (expectedAmount > 0 && Number(slip.amount) !== Number(expectedAmount)) {
+            return { ok: false, reason: '1013', data: slip };
         }
 
         return { ok: true, reason: 'VERIFIED', data: slip };
     } catch (err) {
-        const code = err.response?.data?.error?.code;
-        if (code) return { ok: false, reason: code };
-        console.error('❌ EasySlip API Error:', err.message);
+        const code = err.response?.data?.code;
+        if (code) return { ok: false, reason: String(code), data: err.response.data.data };
+        console.error('❌ SlipOK API Error:', err.message);
         return { ok: false, reason: 'NETWORK_ERROR' };
     }
 }
 
-/** แปลงรหัสข้อผิดพลาดของ EasySlip เป็นข้อความภาษาไทยที่เข้าใจง่าย */
+/** แปลงรหัสข้อผิดพลาดของ SlipOK เป็นข้อความภาษาไทยที่เข้าใจง่าย */
 function slipErrorMessage(reason) {
     const map = {
-        NO_API_KEY:       'ยังไม่ได้ตั้งค่าระบบตรวจสลิปอัตโนมัติ (EASYSLIP_API_KEY) — รอแอดมินตรวจสอบด้วยตนเองนะครับ',
-        SLIP_NOT_FOUND:   'ไม่พบ QR Code ในรูปภาพ กรุณาส่งรูปสลิปที่เห็น QR ชัดเจนอีกครั้ง',
-        SLIP_PENDING:     'สลิปธนาคารกรุงเทพยังไม่เข้าระบบ กรุณารอสักครู่แล้วส่งใหม่อีกครั้ง',
-        INVALID_IMAGE_FORMAT: 'ไฟล์ที่ส่งมาไม่ใช่รูปภาพที่ถูกต้อง กรุณาส่งใหม่เป็นไฟล์ JPG/PNG',
-        IMAGE_SIZE_TOO_LARGE: 'ไฟล์รูปใหญ่เกินไป (เกิน 4MB) กรุณาส่งรูปที่มีขนาดเล็กลง',
-        DUPLICATE_SLIP:   'สลิปนี้เคยถูกใช้ยืนยันการชำระเงินไปแล้ว ไม่สามารถใช้ซ้ำได้ กรุณาติดต่อแอดมิน',
-        AMOUNT_MISMATCH:  'ยอดเงินในสลิปไม่ตรงกับยอดที่ต้องชำระ กรุณาตรวจสอบและโอนให้ครบ หรือแจ้งแอดมิน',
-        NETWORK_ERROR:    'ระบบตรวจสลิปขัดข้องชั่วคราว รอแอดมินตรวจสอบด้วยตนเองนะครับ'
+        NO_API_KEY: 'ยังไม่ได้ตั้งค่าระบบตรวจสลิปอัตโนมัติ (SLIPOK_API_KEY / SLIPOK_BRANCH_ID) — รอแอดมินตรวจสอบด้วยตนเองนะครับ',
+        '1002':     'ระบบตรวจสลิปตั้งค่าไม่ถูกต้อง (API Key ผิด) — รอแอดมินตรวจสอบด้วยตนเองนะครับ',
+        '1003':     'แพ็กเกจระบบตรวจสลิปหมดอายุ — รอแอดมินตรวจสอบด้วยตนเองนะครับ',
+        '1004':     'โควต้าตรวจสลิปหมด — รอแอดมินตรวจสอบด้วยตนเองนะครับ',
+        '1005':     'ไฟล์ที่ส่งมาไม่ใช่รูปภาพที่ถูกต้อง กรุณาส่งใหม่เป็นไฟล์ JPG/PNG',
+        '1006':     'รูปภาพไม่ถูกต้อง กรุณาส่งรูปสลิปใหม่อีกครั้ง',
+        '1007':     'ไม่พบ QR Code ในรูปภาพ กรุณาส่งรูปสลิปที่เห็น QR ชัดเจนอีกครั้ง',
+        '1008':     'QR Code ในรูปไม่ใช่สลิปโอนเงิน กรุณาส่งรูปสลิปที่ถูกต้อง',
+        '1009':     'ธนาคารยังไม่ตอบสนอง กรุณารอสักครู่แล้วส่งสลิปใหม่อีกครั้ง',
+        '1010':     'สลิปยังไม่เข้าระบบธนาคาร กรุณารอประมาณ 5 นาทีแล้วส่งใหม่อีกครั้ง',
+        '1011':     'ไม่พบข้อมูลสลิปนี้ หรือ QR Code หมดอายุ กรุณาตรวจสอบแล้วส่งใหม่อีกครั้ง',
+        '1012':     'สลิปนี้เคยถูกใช้ยืนยันการชำระเงินไปแล้ว ไม่สามารถใช้ซ้ำได้ กรุณาติดต่อแอดมิน',
+        '1013':     'ยอดเงินในสลิปไม่ตรงกับยอดที่ต้องชำระ กรุณาตรวจสอบและโอนให้ครบ หรือแจ้งแอดมิน',
+        '1014':     'บัญชีผู้รับในสลิปไม่ตรงกับบัญชีของร้าน กรุณาตรวจสอบว่าโอนถูกบัญชี หรือแจ้งแอดมิน',
+        NETWORK_ERROR: 'ระบบตรวจสลิปขัดข้องชั่วคราว รอแอดมินตรวจสอบด้วยตนเองนะครับ'
     };
     return map[reason] || 'ตรวจสอบสลิปไม่สำเร็จ กรุณาลองส่งใหม่อีกครั้ง หรือรอแอดมินตรวจสอบด้วยตนเอง';
 }
@@ -358,15 +362,15 @@ client.on('messageCreate', async (message) => {
         if (ticketData.price > 0 && !isAdmin && image && !ticketData.slipVerified) {
             const checkingMsg = await message.reply('🔍 กำลังตรวจสอบสลิป กรุณารอสักครู่นะครับ...');
 
-            const result = await verifySlip(image.url, ticketData.price, ticketData.payMethod);
+            const result = await verifySlip(image.url, ticketData.price);
 
             if (result.ok) {
                 ticketData.slipVerified = true;
                 ticketData.slipReceived = true;
                 ticketData.slipInfo = {
-                    transRef: result.data.rawSlip?.transRef ?? '-',
-                    amount:   result.data.rawSlip?.amount?.amount ?? ticketData.price,
-                    sender:   result.data.rawSlip?.sender?.account?.name?.th ?? 'ไม่ทราบชื่อ'
+                    transRef: result.data.transRef ?? '-',
+                    amount:   Number(result.data.amount) || ticketData.price,
+                    sender:   result.data.sender?.displayName ?? result.data.sender?.name ?? 'ไม่ทราบชื่อ'
                 };
                 saveTickets();
 
@@ -378,7 +382,7 @@ client.on('messageCreate', async (message) => {
                         { name: '💰 ยอดโอน',    value: `${ticketData.slipInfo.amount.toLocaleString()} บาท`, inline: true },
                         { name: '🔖 เลขอ้างอิง', value: `\`${ticketData.slipInfo.transRef}\``, inline: false }
                     )
-                    .setFooter({ text: 'ตรวจสอบผ่าน EasySlip • รอแอดมินดำเนินการต่อ' });
+                    .setFooter({ text: 'ตรวจสอบผ่าน SlipOK • รอแอดมินดำเนินการต่อ' });
 
                 await checkingMsg.edit({ content: null, embeds: [verifiedEmbed] });
                 await message.channel.send(`🔔 <@&${ADMIN_ROLE_ID}> ลูกค้าโอนเงินแล้ว **ตรวจสอบสลิปผ่าน ✅** (คิวที่ ${ticketData.qNum})`);
@@ -403,7 +407,7 @@ client.on('messageCreate', async (message) => {
                 await checkingMsg.edit({ content: `❌ ${slipErrorMessage(result.reason)}` });
 
                 // กรณีระบบขัดข้อง/ไม่ได้ตั้งค่าคีย์ ให้แจ้งแอดมินมาตรวจเองแทน จะได้ไม่ตกหล่น
-                if (['NO_API_KEY', 'NETWORK_ERROR'].includes(result.reason) && !ticketData.slipReceived) {
+                if (['NO_API_KEY', 'NETWORK_ERROR', '1002', '1003', '1004'].includes(result.reason) && !ticketData.slipReceived) {
                     ticketData.slipReceived = true;
                     saveTickets();
                     await message.channel.send(`🔔 <@&${ADMIN_ROLE_ID}> ลูกค้าส่งสลิปมาแต่ระบบตรวจอัตโนมัติใช้งานไม่ได้ กรุณาตรวจสอบด้วยตนเองครับ (คิวที่ ${ticketData.qNum})`);
