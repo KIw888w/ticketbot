@@ -27,14 +27,12 @@ const REVIEW_CHANNEL_ID      = '1554881839745994883'; // ห้องรีว�
 const SLIP_NOTIFY_CHANNEL_ID = '1555145911879864380'; // ห้องแจ้งเตือนเมื่อตรวจสอบสลิปผ่านแล้ว
 const LOG_CHANNEL_ID         = '1555884270680145960'; // ห้อง log สรุปรายการของลูกค้า (ส่งก่อนลบห้องตั๋ว)
 
-// อิโมจิปุ่ม "รับงาน" (blackverified) — ต้องอัปโหลดอิโมจิเข้าเซิร์ฟเวอร์ก่อน แล้วเอาไอดีมาใส่ตรงนี้
-// วิธีหาไอดี: พิมพ์ \:blackverified: ในแชท จะได้ <a:blackverified:123456789> ตัวเลขตรงกลางคือไอดี
-// (ใส่ไอดีแล้ว) ถ้าลบไอดีออกให้ว่าง ปุ่มจะใช้ ✅ แทน
-const WORK_EMOJI_ID   = '1556884242041020456';
-const WORK_EMOJI_NAME = 'blackverified';
-const WORK_EMOJI      = WORK_EMOJI_ID
-    ? { id: WORK_EMOJI_ID, name: WORK_EMOJI_NAME, animated: true }
-    : '✅';
+// อิโมจิ (ใส่เป็นไอดี) — อิโมจิต้องอยู่ในเซิร์ฟเวอร์ที่บอทอยู่ (หรืออัปโหลดเป็น Application Emoji)
+// ถ้าบอทหาอิโมจิไม่เจอ ปุ่มจะใช้อิโมจิธรรมดาแทน และมีคำเตือนใน Console
+const WORK_EMOJI_ID = '1556884242041020456'; // ปุ่ม "รับงาน" (blackverified)
+const DONE_EMOJI_ID = '1285847714076033114'; // ปุ่ม "ปิดห้อง"
+// อิโมจิที่บอทกดรีแอคชั่นให้ทุกข้อความในห้องรีวิว (REVIEW_CHANNEL_ID)
+const REVIEW_REACTION_IDS = ['1556884242041020456', '1557040976973795438'];
 
 const CLOSE_DELAY_MS = 10 * 60 * 1000;      // กดปิดห้องแล้ว รอ 10 นาที → ส่ง log แล้วลบห้อง
 const AUTO_CLOSE_MS  = 24 * 60 * 60 * 1000; // ลูกค้าไม่พิมพ์ในตั๋วครบ 24 ชม. → ปิดอัตโนมัติ (ข้อความแอดมินไม่นับ)
@@ -183,6 +181,79 @@ function buildReviewChannelName(currentName, count) {
         return currentName.replace(/〔\d+〕/, `〔${count}〕`);
     }
     return `${currentName}〔${count}〕`;
+}
+
+// ── อิโมจิ ──
+function findEmoji(id) {
+    return client.emojis.cache.get(id) ?? client.application?.emojis?.cache?.get(id) ?? null;
+}
+
+const warnedEmoji = new Set();
+function warnEmojiOnce(id, where) {
+    if (warnedEmoji.has(id)) return;
+    warnedEmoji.add(id);
+    console.error(`⚠️ ไม่พบอิโมจิไอดี ${id} (${where}) — อิโมจิต้องอยู่ในเซิร์ฟเวอร์ที่บอทอยู่ หรืออัปโหลดเป็น Application Emoji`);
+}
+
+/** อิโมจิสำหรับปุ่ม: ใช้อิโมจิเซิร์ฟเวอร์ถ้าหาเจอ ไม่งั้นใช้ fallback (อิโมจิธรรมดา) */
+function buttonEmoji(id, fallback) {
+    const e = findEmoji(id);
+    if (!e) { warnEmojiOnce(id, 'ปุ่ม'); return fallback; }
+    return { id: e.id, name: e.name, animated: e.animated };
+}
+
+// ── กดรีแอคชั่นข้อความในห้องรีวิว (ข้ามอันที่บอทเคยกดแล้ว) ──
+const reactErrorLogged = new Set();
+
+async function reactToReview(message) {
+    if (message.system) return false;
+    let added = false;
+
+    for (const id of REVIEW_REACTION_IDS) {
+        if (message.reactions.cache.some(r => r.emoji.id === id && r.me)) continue; // เคยกดแล้ว
+
+        const emoji = findEmoji(id);
+        if (!emoji) { warnEmojiOnce(id, 'รีแอคชั่น'); continue; }
+
+        try {
+            await message.react(emoji);
+            added = true;
+        } catch (err) {
+            if (err.code === 10008) return added; // ข้อความถูกลบไปแล้ว
+            const key = String(err.code ?? err.message);
+            if (!reactErrorLogged.has(key)) { // log ครั้งเดียวต่อชนิด error จะได้ไม่ท่วม Console
+                reactErrorLogged.add(key);
+                console.error('❌ กดรีแอคชั่นไม่ได้ (เช็คสิทธิ์ Add Reactions / Read Message History / Use External Emojis ของบอทในห้องรีวิว):', err.message);
+            }
+        }
+    }
+    return added;
+}
+
+/** ไล่กดรีแอคชั่นย้อนหลังทุกข้อความในห้องรีวิว (ทำเบื้องหลังตอนบอทเริ่มรัน) */
+async function backfillReviewReactions() {
+    const channel = await client.channels.fetch(REVIEW_CHANNEL_ID);
+    if (!channel?.messages) {
+        console.error('❌ ห้องรีวิวไม่ใช่ห้องข้อความ ย้อนกดรีแอคชั่นไม่ได้');
+        return;
+    }
+
+    let before;
+    let scanned = 0, reacted = 0;
+    console.log('⏳ เริ่มย้อนกดรีแอคชั่นห้องรีวิว (ข้อความที่เคยกดแล้วจะข้าม)...');
+
+    while (true) {
+        const batch = await channel.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+        if (batch.size === 0) break;
+
+        for (const msg of batch.values()) {
+            scanned++;
+            if (await reactToReview(msg)) reacted++;
+        }
+        before = batch.last().id; // ข้อความเก่าสุดในชุดนี้ ใช้ดึงชุดถัดไป
+    }
+
+    console.log(`✅ ย้อนกดรีแอคชั่นห้องรีวิวเสร็จ: สแกน ${scanned} ข้อความ / กดเพิ่ม ${reacted} ข้อความ`);
 }
 
 // ── ปิดตั๋ว: รอ 10 นาที → ส่ง log สรุปลูกค้าเข้าห้อง log → ลบห้องตั๋วทิ้ง ──
@@ -400,6 +471,10 @@ client.once(Events.ClientReady, async () => {
     } catch (err) {
         console.error('❌ บอทเข้าถึงห้องรีวิวไม่ได้ — เช็ค REVIEW_CHANNEL_ID ว่าถูกเซิร์ฟเวอร์ และบอทเห็นห้องนี้:', err.message);
     }
+
+    // โหลดอิโมจิของแอป (ถ้ามี) แล้วย้อนกดรีแอคชั่นทุกข้อความเก่าในห้องรีวิว (ทำเบื้องหลัง ไม่ขวางบอท)
+    await client.application?.emojis?.fetch().catch(() => {});
+    backfillReviewReactions().catch(err => console.error('❌ ย้อนกดรีแอคชั่นห้องรีวิวไม่สำเร็จ:', err.message));
 });
 
 // ห้องตั๋วถูกลบ (โดยบอทหรือแอดมินลบมือ) → เคลียร์ข้อมูล ลูกค้าจะได้เปิดตั๋วใหม่ได้
@@ -415,6 +490,11 @@ client.on(Events.ChannelDelete, (channel) => {
 // [ 7. Message Handler: คำสั่งแอดมิน + ตรวจจับสลิป + นับรีวิว ]
 // ==========================================
 client.on('messageCreate', async (message) => {
+    // ── กดรีแอคชั่นทุกข้อความใหม่ในห้องรีวิว (เช็คก่อนกรองบอท เพื่อให้ได้ทุกข้อความ ยกเว้นของบอทเราเอง) ──
+    if (message.guild && message.channel.id === REVIEW_CHANNEL_ID && message.author.id !== client.user.id) {
+        reactToReview(message); // ไม่ await เพื่อไม่ขวางการนับรีวิว (ฟังก์ชันจับ error เองแล้ว)
+    }
+
     if (!message.guild || message.author.bot) return;
 
     // ── ระบบนับรีวิว (เช็คก่อนคำสั่ง เพื่อให้รีวิวที่ขึ้นต้นด้วย ! ก็นับ) ──
@@ -668,8 +748,8 @@ client.on('interactionCreate', async (interaction) => {
 
                 // ปุ่มสีดำ (ใน Discord ใกล้เคียงสุดคือ Secondary สีเทาเข้ม) — กดได้เฉพาะแอดมิน
                 const btns = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder().setCustomId('btn_work').setLabel('รับงาน').setEmoji(WORK_EMOJI).setStyle(ButtonStyle.Secondary),
-                    new ButtonBuilder().setCustomId('btn_done').setLabel('ปิดห้อง').setEmoji('❌').setStyle(ButtonStyle.Secondary)
+                    new ButtonBuilder().setCustomId('btn_work').setLabel('รับงาน').setEmoji(buttonEmoji(WORK_EMOJI_ID, '✅')).setStyle(ButtonStyle.Secondary),
+                    new ButtonBuilder().setCustomId('btn_done').setLabel('ปิดห้อง').setEmoji(buttonEmoji(DONE_EMOJI_ID, '❌')).setStyle(ButtonStyle.Secondary)
                 );
 
                 const panel = await channel.send({ content: `🔔 <@&${ADMIN_ROLE_ID}>`, embeds: [embed], components: [btns] });
