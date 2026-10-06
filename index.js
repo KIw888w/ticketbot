@@ -21,11 +21,23 @@ const axios = require('axios');
 // [ 3. Config / Constants ]
 // ==========================================
 // ⚠️ แก้ไอดีเหล่านี้ให้ตรงกับเซิร์ฟเวอร์ของคุณก่อนรันบอท
-const ADMIN_ROLE_ID          = '1555146265958944878'; // Role แอดมินที่รับตั๋ว/สร้าง QR ได้
+const ADMIN_ROLE_ID          = '1555146265958944878'; // Role แอดมินที่รับตั๋ว/สร้าง QR/ปิดห้องได้
 const TICKET_CATEGORY_ID     = '1554881839422906495'; // Category สำหรับสร้างห้องตั๋ว
-const DONE_CATEGORY_ID       = '1554881839745994884'; // Category ที่ย้ายห้องไปเก็บหลังปิดตั๋ว
 const REVIEW_CHANNEL_ID      = '1554881839745994883'; // ห้องรีวิว (เอาไว้นับจำนวน)
 const SLIP_NOTIFY_CHANNEL_ID = '1555145911879864380'; // ห้องแจ้งเตือนเมื่อตรวจสอบสลิปผ่านแล้ว
+const LOG_CHANNEL_ID         = '1555884270680145960'; // ห้อง log สรุปรายการของลูกค้า (ส่งก่อนลบห้องตั๋ว)
+
+// อิโมจิปุ่ม "รับงาน" (blackverified) — ต้องอัปโหลดอิโมจิเข้าเซิร์ฟเวอร์ก่อน แล้วเอาไอดีมาใส่ตรงนี้
+// วิธีหาไอดี: พิมพ์ \:blackverified: ในแชท จะได้ <a:blackverified:123456789> ตัวเลขตรงกลางคือไอดี
+// (ใส่ไอดีแล้ว) ถ้าลบไอดีออกให้ว่าง ปุ่มจะใช้ ✅ แทน
+const WORK_EMOJI_ID   = '1556884242041020456';
+const WORK_EMOJI_NAME = 'blackverified';
+const WORK_EMOJI      = WORK_EMOJI_ID
+    ? { id: WORK_EMOJI_ID, name: WORK_EMOJI_NAME, animated: true }
+    : '✅';
+
+const CLOSE_DELAY_MS = 10 * 60 * 1000;      // กดปิดห้องแล้ว รอ 10 นาที → ส่ง log แล้วลบห้อง
+const AUTO_CLOSE_MS  = 24 * 60 * 60 * 1000; // ลูกค้าไม่พิมพ์ในตั๋วครบ 24 ชม. → ปิดอัตโนมัติ (ข้อความแอดมินไม่นับ)
 
 const PROMPTPAY_NUMBER = '0621473585'; // เบอร์พร้อมเพย์รับเงิน
 const SLIPOK_API_KEY   = process.env.SLIPOK_API_KEY;   // ⚠️ API Key จากหน้า SlipOK (slipok.com) ใส่ในไฟล์ .env
@@ -38,7 +50,12 @@ const REVIEW_COUNT_FILE = './review_count.json';
 // ==========================================
 // [ 4. Runtime State ]
 // ==========================================
-let activeTicketData = {}; // activeTicketData[channelId] = { category, label, price, userId, qNum, payMethod, slipReceived, slipVerified, slipInfo }
+// activeTicketData[channelId] = {
+//   category, label, price, userId, qNum, payMethod, slipReceived, slipVerified, slipInfo,
+//   payments[], openedAt, lastActivityAt, panelMessageId, acceptedBy, acceptedAt,
+//   closeAt, closedBy, autoClosed, logged, closeTries
+// }
+let activeTicketData = {};
 let queueCount         = 1;
 let reviewCount         = 0;
 
@@ -66,6 +83,13 @@ function loadPersistentData() {
 function saveTickets()     { fs.writeFileSync(TICKET_FILE, JSON.stringify(activeTicketData, null, 2)); }
 function saveQueue()       { fs.writeFileSync(QUEUE_FILE, queueCount.toString()); }
 function saveReviewCount() { fs.writeFileSync(REVIEW_COUNT_FILE, JSON.stringify({ count: reviewCount })); }
+
+// เซฟแบบหน่วง (ใช้กับเวลาคุยล่าสุด จะได้ไม่เขียนไฟล์ทุกข้อความ)
+let saveTicketsTimer = null;
+function saveTicketsSoon() {
+    if (saveTicketsTimer) return;
+    saveTicketsTimer = setTimeout(() => { saveTicketsTimer = null; saveTickets(); }, 30 * 1000);
+}
 
 loadPersistentData();
 
@@ -161,9 +185,9 @@ function buildReviewChannelName(currentName, count) {
     return `${currentName}〔${count}〕`;
 }
 
-// ── ปิดตั๋ว: รอ 10 นาที แล้วย้ายเข้าหมวดเก็บงาน + ซ่อนห้องจากลูกค้า ──
-const CLOSE_DELAY_MS = 10 * 60 * 1000;
+// ── ปิดตั๋ว: รอ 10 นาที → ส่ง log สรุปลูกค้าเข้าห้อง log → ลบห้องตั๋วทิ้ง ──
 const closeTimers    = new Map(); // channelId -> timeout
+const creatingTicket = new Set(); // userId ที่กำลังสร้างตั๋วอยู่ (กันกดรัว)
 
 function scheduleClose(channelId, delayMs) {
     if (closeTimers.has(channelId)) return;
@@ -174,24 +198,150 @@ function scheduleClose(channelId, delayMs) {
     closeTimers.set(channelId, timer);
 }
 
-async function closeTicket(channelId) {
-    const data   = activeTicketData[channelId];
-    const userId = data?.userId;
+/** เริ่มนับถอยหลังปิดตั๋ว (บันทึกลงไฟล์ เผื่อบอทรีสตาร์ท) — คืน false ถ้าตั๋วนี้ปิดไปแล้ว/ไม่ใช่ตั๋ว */
+function beginClose(channelId, { closedBy = null, auto = false } = {}) {
+    const data = activeTicketData[channelId];
+    if (!data || data.category !== 'ticket' || data.closeAt) return false;
+
+    data.closeAt    = Date.now() + CLOSE_DELAY_MS;
+    data.closedBy   = closedBy;
+    data.autoClosed = auto;
+    saveTickets();
+    scheduleClose(channelId, CLOSE_DELAY_MS);
+    return true;
+}
+
+/** เอมเบดข้อความตอนปิดห้อง */
+function buildCloseEmbed(auto) {
+    const mins = CLOSE_DELAY_MS / 60000;
+    const head = auto
+        ? `ห้องนี้ถูกปิดอัตโนมัติ เนื่องจากลูกค้าไม่ตอบกลับในห้องครบ ${AUTO_CLOSE_MS / 3600000} ชั่วโมง\nห้องนี้จะถูกลบภายใน ${mins} นาที (ถ้ายังต้องการใช้บริการ เปิดตั๋วใหม่ได้หลังห้องนี้ถูกลบครับ)`
+        : `ห้องนี้ถูกปิดแล้วครับ ห้องนี้จะถูกลบภายใน ${mins} นาที`;
+
+    return new EmbedBuilder()
+        .setColor('#2ECC71')
+        .setTitle('✅ ปิดห้องแล้ว')
+        .setDescription(
+`${head}
+
+เมื่อ ADMIN กดของเสร็จแล้ว ลูกค้าอย่าลืมเปลี่ยน Password เพื่อความปลอดภัยของตัวลูกค้าเองนะคั้บบ
+
+💖 ขอบคุณที่ใช้บริการครับ ฝากรีวิวได้ที่ <#${REVIEW_CHANNEL_ID}>`
+        );
+}
+
+/** ส่ง log สรุปว่าลูกค้าคนนี้ทำรายการอะไรไปบ้าง เข้าห้อง LOG_CHANNEL_ID
+ *  (ตั้งใจไม่เก็บข้อความแชทของลูกค้า เพราะอาจมีรหัสผ่าน/ข้อมูลส่วนตัวปนอยู่) */
+async function sendTicketLog(data) {
+    const ts = (ms) => `<t:${Math.floor(ms / 1000)}:F>`;
+
+    let username = 'ไม่ทราบ';
+    if (data.userId) {
+        const user = await client.users.fetch(data.userId).catch(() => null);
+        if (user) username = user.username;
+    }
+
+    // สรุปการชำระเงิน
+    const payments = data.payments ?? [];
+    let payText;
+    if (payments.length > 0) {
+        payText = payments.slice(0, 10).map(p =>
+            `• **${Number(p.amount).toLocaleString()} บาท** — ผู้โอน: ${p.sender} — อ้างอิง: \`${p.transRef}\``
+        ).join('\n');
+    } else if (data.slipReceived) {
+        payText = '⏳ ลูกค้าส่งสลิปมา แต่ระบบตรวจอัตโนมัติใช้ไม่ได้ (ให้แอดมินตรวจเอง)';
+    } else if (data.price > 0) {
+        payText = `แจ้งยอด ${Number(data.price).toLocaleString()} บาท แต่ยังไม่มีการชำระ`;
+    } else {
+        payText = 'ไม่มีการแจ้งยอด / ไม่มีการชำระเงิน';
+    }
+
+    const embed = new EmbedBuilder()
+        .setColor('#2B2D31')
+        .setTitle(`📋 Log ตั๋ว #${data.qNum}`)
+        .addFields(
+            { name: '👤 ลูกค้า',        value: data.userId ? `<@${data.userId}> (${username})\n\`${data.userId}\`` : 'ไม่ทราบ', inline: true },
+            { name: '🎫 ตั๋ว',          value: `#${data.qNum}`, inline: true },
+            { name: '🕒 เปิดเมื่อ',      value: data.openedAt ? ts(data.openedAt) : 'ไม่ทราบ', inline: false },
+            { name: '🛠️ รับงานโดย',     value: data.acceptedBy ? `<@${data.acceptedBy}>` : 'ไม่มีผู้รับงาน', inline: true },
+            { name: '🔒 ปิดโดย',        value: data.closedBy ? `<@${data.closedBy}>` : (data.autoClosed ? 'ระบบอัตโนมัติ (ลูกค้าไม่ตอบ 24 ชม.)' : 'ไม่ทราบ'), inline: true },
+            { name: '💰 รายการชำระเงิน', value: payText.slice(0, 1024), inline: false }
+        )
+        .setTimestamp();
 
     try {
+        const logChannel = await client.channels.fetch(LOG_CHANNEL_ID);
+        await logChannel.send({ embeds: [embed] });
+    } catch (err) {
+        console.error('❌ ส่ง log เข้าห้อง LOG_CHANNEL_ID ไม่ได้ (เช็คไอดีห้อง และสิทธิ์ View/Send ของบอท):', err.message);
+        console.log('📋 LOG สำรอง:', JSON.stringify(data));
+    }
+}
+
+async function closeTicket(channelId) {
+    const data = activeTicketData[channelId];
+    if (!data || data.category !== 'ticket') return; // กันลบห้องที่ไม่ใช่ห้องตั๋ว
+
+    // 1) ส่ง log (ครั้งเดียว ถึงลบห้องไม่สำเร็จแล้วลองใหม่ก็ไม่ส่งซ้ำ)
+    if (!data.logged) {
+        await sendTicketLog(data);
+        data.logged = true;
+        saveTickets();
+    }
+
+    // 2) ลบห้องตั๋ว
+    try {
         const chan = await client.channels.fetch(channelId);
-        await chan.setParent(DONE_CATEGORY_ID, { lockPermissions: false });
-        if (userId) await chan.permissionOverwrites.edit(userId, { ViewChannel: false });
-        console.log(`📦 ตั๋ว #${data?.qNum ?? '?'} ย้ายเข้าหมวดเก็บงานและซ่อนจากลูกค้าแล้ว`);
+        await chan.delete(`ตั๋ว #${data.qNum} ครบเวลาปิดห้อง`);
+        console.log(`🗑️ ลบตั๋ว #${data.qNum} เรียบร้อย`);
     } catch (err) {
         if (err.code !== 10003) { // 10003 = Unknown Channel (ห้องถูกลบไปแล้ว ก็ถือว่าเสร็จ)
-            console.error(`❌ ย้าย/ซ่อนตั๋ว ${channelId} ไม่สำเร็จ (เช็ค DONE_CATEGORY_ID, สิทธิ์ Manage Channels, หมวดเต็ม 50 ห้อง):`, err.message);
-            return; // เก็บข้อมูลไว้ จะลองใหม่ตอนบอทเริ่มรันครั้งถัดไป
+            data.closeTries = (data.closeTries || 0) + 1;
+            saveTickets();
+            console.error(`❌ ลบตั๋ว #${data.qNum} ไม่สำเร็จ (เช็คสิทธิ์ Manage Channels ของบอท):`, err.message);
+            if (data.closeTries < 5) scheduleClose(channelId, 2 * 60 * 1000); // ลองใหม่ใน 2 นาที
+            return;
         }
     }
 
     delete activeTicketData[channelId];
     saveTickets();
+}
+
+/** ปิดตั๋วอัตโนมัติเมื่อไม่มีใครตอบในห้องครบ 24 ชม. */
+async function autoCloseTicket(channelId) {
+    const data = activeTicketData[channelId];
+    if (!beginClose(channelId, { closedBy: null, auto: true })) return;
+
+    const chan = await client.channels.fetch(channelId).catch(() => null);
+    if (!chan) return; // ห้องหาย — ตัวจับเวลา/ChannelDelete จะเคลียร์เอง
+
+    if (data.panelMessageId) {
+        chan.messages.fetch(data.panelMessageId).then(m => m.edit({ components: [] })).catch(() => {});
+    }
+    await chan.send({
+        content: data.userId ? `<@${data.userId}>` : undefined,
+        embeds: [buildCloseEmbed(true)]
+    }).catch(() => {});
+    chan.setName(`✅-${data.qNum}`).catch(() => {});
+}
+
+async function checkInactiveTickets() {
+    const now = Date.now();
+    for (const [channelId, data] of Object.entries(activeTicketData)) {
+        if (data.category !== 'ticket' || data.closeAt) continue;
+
+        const last = data.lastActivityAt ?? data.openedAt;
+        if (!last) { // ตั๋วเก่าที่ยังไม่มีบันทึกเวลา → เริ่มนับจากตอนนี้
+            data.lastActivityAt = now;
+            saveTickets();
+            continue;
+        }
+        if (now - last >= AUTO_CLOSE_MS) {
+            console.log(`⏰ ตั๋ว #${data.qNum} ลูกค้าไม่ตอบครบ 24 ชม. → ปิดอัตโนมัติ`);
+            await autoCloseTicket(channelId);
+        }
+    }
 }
 
 // ── เปลี่ยนชื่อห้องรีวิว: Discord จำกัดการเปลี่ยนชื่อห้อง 2 ครั้ง/10 นาที
@@ -234,6 +384,10 @@ client.once(Events.ClientReady, async () => {
         if (data.closeAt) scheduleClose(channelId, data.closeAt - Date.now());
     }
 
+    // ตรวจตั๋วที่เงียบครบ 24 ชม. ทุก 5 นาที
+    checkInactiveTickets().catch(err => console.error('❌ checkInactiveTickets:', err));
+    setInterval(() => checkInactiveTickets().catch(err => console.error('❌ checkInactiveTickets:', err)), 5 * 60 * 1000);
+
     // ซิงค์เลขรีวิวจากชื่อห้อง (กันนับใหม่จาก 0 ทับเลขเดิม) + ตรวจว่าบอทเข้าถึงห้องรีวิวได้
     try {
         const ch = await client.channels.fetch(REVIEW_CHANNEL_ID);
@@ -246,6 +400,15 @@ client.once(Events.ClientReady, async () => {
     } catch (err) {
         console.error('❌ บอทเข้าถึงห้องรีวิวไม่ได้ — เช็ค REVIEW_CHANNEL_ID ว่าถูกเซิร์ฟเวอร์ และบอทเห็นห้องนี้:', err.message);
     }
+});
+
+// ห้องตั๋วถูกลบ (โดยบอทหรือแอดมินลบมือ) → เคลียร์ข้อมูล ลูกค้าจะได้เปิดตั๋วใหม่ได้
+client.on(Events.ChannelDelete, (channel) => {
+    if (!activeTicketData[channel.id]) return;
+    const timer = closeTimers.get(channel.id);
+    if (timer) { clearTimeout(timer); closeTimers.delete(channel.id); }
+    delete activeTicketData[channel.id];
+    saveTickets();
 });
 
 // ==========================================
@@ -265,6 +428,13 @@ client.on('messageCreate', async (message) => {
             scheduleReviewRename();
             return;
         }
+    }
+
+    // ── บันทึกเวลาที่ "ลูกค้า" พิมพ์ล่าสุดในตั๋ว ไว้ใช้ปิดอัตโนมัติ 24 ชม. (แอดมินพิมพ์/แท็กไม่นับ) ──
+    const activity = activeTicketData[message.channel.id];
+    if (activity && activity.category === 'ticket' && !activity.closeAt && message.author.id === activity.userId) {
+        activity.lastActivityAt = Date.now();
+        saveTicketsSoon();
     }
 
     // ── คำสั่งแอดมิน (เช็คก่อนเสมอ แม้จะพิมพ์ในห้องตั๋วก็ใช้ได้) ──────
@@ -321,7 +491,9 @@ client.on('messageCreate', async (message) => {
             let qNum = existing?.qNum;
             if (!qNum) { qNum = queueCount++; saveQueue(); }
 
+            // ...existing เพื่อคงข้อมูลตั๋วเดิมไว้ (เวลาเปิด, ผู้รับงาน, ประวัติชำระเงิน ฯลฯ)
             activeTicketData[targetId] = {
+                ...existing,
                 category:     existing?.category ?? 'manual',
                 label:        existing?.label ?? 'ชำระเงิน',
                 price:        amount,
@@ -372,6 +544,9 @@ client.on('messageCreate', async (message) => {
                     amount:   Number(result.data.amount) || ticketData.price,
                     sender:   result.data.sender?.displayName ?? result.data.sender?.name ?? 'ไม่ทราบชื่อ'
                 };
+                // เก็บประวัติการชำระเงินไว้สรุปใน log ตอนปิดตั๋ว
+                if (!Array.isArray(ticketData.payments)) ticketData.payments = [];
+                ticketData.payments.push({ ...ticketData.slipInfo, at: Date.now() });
                 saveTickets();
 
                 const verifiedEmbed = new EmbedBuilder()
@@ -420,9 +595,11 @@ client.on('messageCreate', async (message) => {
 // ════════════════════════════════════════════════════════════
 //  TICKET FLOW
 //
-//  create_ticket → สร้างห้องตั๋วทันที ไม่ถามอะไรเลย
+//  create_ticket → สร้างห้องตั๋วทันที (ลูกค้า 1 คนมีตั๋วเปิดได้ทีละ 1 ห้อง จนกว่าห้องเก่าจะถูกลบ)
 //  แอดมินใช้ !qr [ยอด] [ห้อง] เพื่อแจ้งยอด+สร้าง QR เมื่อไหร่ก็ได้ ห้องไหนก็ได้
-//  ADMIN: btn_work (รับงาน)  |  btn_done (ปิดห้อง — แอดมินหรือเจ้าของตั๋วกดได้)
+//  ADMIN เท่านั้น: btn_work (รับงาน)  |  btn_done (ปิดห้อง)
+//  ปิดห้องแล้ว 10 นาที → ส่ง log เข้าห้อง LOG_CHANNEL_ID → ลบห้อง
+//  ลูกค้าไม่พิมพ์ในตั๋วครบ 24 ชม. → ปิดอัตโนมัติ (เข้าขั้นตอนเดียวกับปิดห้อง)
 // ════════════════════════════════════════════════════════════
 
 client.on('interactionCreate', async (interaction) => {
@@ -433,82 +610,112 @@ client.on('interactionCreate', async (interaction) => {
         if (interaction.isButton() && interaction.customId === 'create_ticket') {
             await interaction.deferReply({ ephemeral: true });
 
-            const channel = await interaction.guild.channels.create({
-                name:   `ticket-${queueCount}`,
-                parent: TICKET_CATEGORY_ID,
-                permissionOverwrites: [
-                    { id: interaction.guild.id, deny:  [PermissionFlagsBits.ViewChannel] },
-                    { id: interaction.user.id,  allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.AttachFiles] },
-                    { id: ADMIN_ROLE_ID,         allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] }
-                ]
-            });
+            const userId = interaction.user.id;
+            if (creatingTicket.has(userId))
+                return interaction.editReply({ content: '⏳ กำลังสร้างตั๋วให้คุณอยู่ กรุณารอสักครู่ครับ' });
 
-            activeTicketData[channel.id] = {
-                category:     'ticket',
-                label:        'Ticket',
-                price:        0,
-                userId:       interaction.user.id,
-                qNum:         queueCount,
-                payMethod:    'promptpay',
-                slipReceived: false,
-                slipVerified: false
-            };
-            saveTickets();
+            creatingTicket.add(userId);
+            try {
+                // ลูกค้ายังมีตั๋วเก่าที่ไม่ถูกลบ → เปิดใหม่ไม่ได้
+                const oldId = Object.keys(activeTicketData).find(id =>
+                    activeTicketData[id].category === 'ticket' && activeTicketData[id].userId === userId
+                );
+                if (oldId) {
+                    const oldChan = await interaction.guild.channels.fetch(oldId)
+                        .catch(err => (err.code === 10003 ? null : undefined)); // null = ห้องถูกลบแล้ว, undefined = เช็คไม่ได้
+                    if (oldChan === undefined)
+                        return interaction.editReply({ content: '❌ ตรวจสอบตั๋วเก่าของคุณไม่ได้ในตอนนี้ กรุณาลองใหม่อีกครั้งครับ' });
+                    if (oldChan)
+                        return interaction.editReply({ content: `❌ คุณมีตั๋วที่ยังไม่ถูกลบอยู่ ${oldChan}\nต้องรอให้ตั๋วเดิมถูกลบก่อน จึงจะเปิดตั๋วใหม่ได้ครับ` });
 
-            const embed = new EmbedBuilder()
-                .setTitle(`🎫 Ticket #${queueCount}`)
-                .setColor('#5865F2')
-                .setDescription(`สวัสดีครับ <@${interaction.user.id}>\n\nแจ้งรายละเอียดที่ต้องการได้เลยครับ รอแอดมินเข้ามาดำเนินการและแจ้งยอดชำระให้สักครู่นะครับ`);
+                    // ห้องเก่าไม่อยู่แล้ว เคลียร์ข้อมูลค้าง
+                    delete activeTicketData[oldId];
+                    saveTickets();
+                }
 
-            const btns = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId('btn_work').setLabel('รับงาน').setEmoji('🛠️').setStyle(ButtonStyle.Primary),
-                new ButtonBuilder().setCustomId('btn_done').setLabel('ปิดห้อง').setEmoji('✅').setStyle(ButtonStyle.Success)
-            );
+                const qNum = queueCount++;
+                saveQueue();
 
-            await channel.send({ content: `🔔 <@&${ADMIN_ROLE_ID}>`, embeds: [embed], components: [btns] });
+                const channel = await interaction.guild.channels.create({
+                    name:   `ticket-${qNum}`,
+                    parent: TICKET_CATEGORY_ID,
+                    permissionOverwrites: [
+                        { id: interaction.guild.id, deny:  [PermissionFlagsBits.ViewChannel] },
+                        { id: userId,               allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.AttachFiles] },
+                        { id: ADMIN_ROLE_ID,         allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] }
+                    ]
+                });
 
-            queueCount++;
-            saveQueue();
+                const now = Date.now();
+                activeTicketData[channel.id] = {
+                    category:       'ticket',
+                    label:          'Ticket',
+                    price:          0,
+                    userId,
+                    qNum,
+                    payMethod:      'promptpay',
+                    slipReceived:   false,
+                    slipVerified:   false,
+                    openedAt:       now,
+                    lastActivityAt: now
+                };
+                saveTickets();
 
-            return interaction.editReply({ content: `✅ สร้างตั๋วเรียบร้อยแล้ว! แตะที่นี่ได้เลย 👉 ${channel}` });
+                const embed = new EmbedBuilder()
+                    .setTitle(`🎫 Ticket #${qNum}`)
+                    .setColor('#5865F2')
+                    .setDescription(`สวัสดีครับ <@${userId}>\n\nแจ้งรายละเอียดที่ต้องการได้เลยครับ รอแอดมินเข้ามาดำเนินการและแจ้งยอดชำระให้สักครู่นะครับ`);
+
+                // ปุ่มสีดำ (ใน Discord ใกล้เคียงสุดคือ Secondary สีเทาเข้ม) — กดได้เฉพาะแอดมิน
+                const btns = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId('btn_work').setLabel('รับงาน').setEmoji(WORK_EMOJI).setStyle(ButtonStyle.Secondary),
+                    new ButtonBuilder().setCustomId('btn_done').setLabel('ปิดห้อง').setEmoji('❌').setStyle(ButtonStyle.Secondary)
+                );
+
+                const panel = await channel.send({ content: `🔔 <@&${ADMIN_ROLE_ID}>`, embeds: [embed], components: [btns] });
+                activeTicketData[channel.id].panelMessageId = panel.id;
+                saveTickets();
+
+                return interaction.editReply({ content: `✅ สร้างตั๋วเรียบร้อยแล้ว! แตะที่นี่ได้เลย 👉 ${channel}` });
+            } finally {
+                creatingTicket.delete(userId);
+            }
         }
 
         // ════════════════════════════════════════════════════════════
-        //  ADMIN TICKET BUTTONS
+        //  ADMIN TICKET BUTTONS (กดได้เฉพาะแอดมิน)
         // ════════════════════════════════════════════════════════════
 
-        if (interaction.isButton() && interaction.customId === 'btn_work') {
-            if (!interaction.member.roles.cache.has(ADMIN_ROLE_ID)) return;
+        if (interaction.isButton() && (interaction.customId === 'btn_work' || interaction.customId === 'btn_done')) {
+            if (!interaction.member.roles.cache.has(ADMIN_ROLE_ID))
+                return interaction.reply({ content: '❌ ปุ่มนี้ใช้ได้เฉพาะแอดมินเท่านั้นครับ', ephemeral: true });
+
             const data = activeTicketData[interaction.channel.id];
-            if (!data) return;
+            if (!data)
+                return interaction.reply({ content: '❌ ไม่พบข้อมูลตั๋วนี้ในระบบ (อาจถูกปิดไปแล้ว)', ephemeral: true });
 
-            await interaction.reply({ content: `👨‍💻 <@${interaction.user.id}> รับงานนี้แล้วครับ กำลังดำเนินการให้${data.userId ? ` <@${data.userId}>` : ''}` });
-            return interaction.channel.setName(`🛠️-${data.qNum}`).catch(() => {});
-        }
+            // ── รับงาน ──
+            if (interaction.customId === 'btn_work') {
+                if (data.acceptedBy)
+                    return interaction.reply({ content: `ℹ️ ตั๋วนี้ถูกรับงานโดย <@${data.acceptedBy}> แล้วครับ`, ephemeral: true });
 
-        if (interaction.isButton() && interaction.customId === 'btn_done') {
-            const data = activeTicketData[interaction.channel.id];
-            if (!data) return;
+                data.acceptedBy     = interaction.user.id;
+                data.acceptedAt     = Date.now();
+                saveTickets();
 
-            const isAdmin = interaction.member.roles.cache.has(ADMIN_ROLE_ID);
-            if (!isAdmin && interaction.user.id !== data.userId)
-                return interaction.reply({ content: '❌ คุณไม่มีสิทธิ์ปิดห้องนี้ครับ', ephemeral: true });
+                await interaction.reply({ content: `👨‍💻 <@${interaction.user.id}> รับงานนี้แล้วครับ กำลังดำเนินการให้${data.userId ? ` <@${data.userId}>` : ''}` });
+                return interaction.channel.setName(`🛠️-${data.qNum}`).catch(() => {});
+            }
 
+            // ── ปิดห้อง ──
             if (data.closeAt)
-                return interaction.reply({ content: '⏳ ห้องนี้ถูกปิดไปแล้ว กำลังรอย้ายเข้าหมวดเก็บงานครับ', ephemeral: true });
+                return interaction.reply({ content: '⏳ ห้องนี้ถูกปิดไปแล้ว กำลังรอลบห้องครับ', ephemeral: true });
 
-            // บันทึกเวลาปิดลงไฟล์ก่อน เผื่อบอทรีสตาร์ทระหว่างรอ แล้วตั้งเวลาย้าย+ซ่อน
-            data.closeAt = Date.now() + CLOSE_DELAY_MS;
-            saveTickets();
-            scheduleClose(interaction.channel.id, CLOSE_DELAY_MS);
-
-            const embed = new EmbedBuilder()
-                .setColor('#2ECC71').setTitle('✅ ปิดห้องแล้ว')
-                .setDescription(`ห้องนี้ถูกปิดแล้วครับ ระบบจะย้ายและซ่อนห้องภายใน ${CLOSE_DELAY_MS / 60000} นาที\n\n💖 ขอบคุณที่ใช้บริการครับ ฝากรีวิวได้ที่ <#${REVIEW_CHANNEL_ID}>`);
+            beginClose(interaction.channel.id, { closedBy: interaction.user.id });
 
             await interaction.message.edit({ components: [] }).catch(() => {});
-            await interaction.reply({ embeds: [embed] });
-            // ไม่ await: ถ้าติด rate limit ของการเปลี่ยนชื่อห้อง จะได้ไม่ขวางการย้ายห้อง
+            await interaction.reply({ embeds: [buildCloseEmbed(false)] });
+            // ไม่ await: ถ้าติด rate limit ของการเปลี่ยนชื่อห้อง จะได้ไม่ขวางการลบห้อง
             interaction.channel.setName(`✅-${data.qNum}`).catch(() => {});
             return;
         }
