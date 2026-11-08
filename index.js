@@ -14,52 +14,27 @@ const {
     PermissionFlagsBits, ButtonBuilder, ButtonStyle, Events
 } = require('discord.js');
 
-const fs    = require('fs');
-const axios = require('axios');
+const fs = require('fs');
 
 // ==========================================
 // [ 3. Config / Constants ]
 // ==========================================
 // ⚠️ แก้ไอดีเหล่านี้ให้ตรงกับเซิร์ฟเวอร์ของคุณก่อนรันบอท
-const ADMIN_ROLE_ID          = '1555146265958944878'; // Role แอดมินที่รับตั๋ว/สร้าง QR/ปิดห้องได้
+const ADMIN_ROLE_ID          = '1555146265958944878'; // Role แอดมินที่รับตั๋ว/สร้าง QR ได้
 const TICKET_CATEGORY_ID     = '1554881839422906495'; // Category สำหรับสร้างห้องตั๋ว
+const DONE_CATEGORY_ID       = '1554881839745994884'; // Category ที่ย้ายห้องไปเก็บหลังปิดตั๋ว
 const REVIEW_CHANNEL_ID      = '1554881839745994883'; // ห้องรีวิว (เอาไว้นับจำนวน)
-const SLIP_NOTIFY_CHANNEL_ID = '1555145911879864380'; // ห้องแจ้งเตือนเมื่อตรวจสอบสลิปผ่านแล้ว
-const LOG_CHANNEL_ID         = '1555884270680145960'; // ห้อง log สรุปรายการของลูกค้า (ส่งก่อนลบห้องตั๋ว)
-
-// อิโมจิ (ใส่เป็นไอดี) — อิโมจิต้องอยู่ในเซิร์ฟเวอร์ที่บอทอยู่ (หรืออัปโหลดเป็น Application Emoji)
-// ถ้าบอทหาอิโมจิไม่เจอ ปุ่มจะใช้อิโมจิธรรมดาแทน และมีคำเตือนใน Console
-const WORK_EMOJI_ID = '1556884242041020456'; // ปุ่ม "รับงาน" (blackverified)
-const DONE_EMOJI_ID = '1285847714076033114'; // ปุ่ม "ปิดห้อง"
-// อิโมจิที่บอทกดรีแอคชั่นให้ทุกข้อความในห้องรีวิว (REVIEW_CHANNEL_ID)
-const REVIEW_REACTION_IDS = ['1556884242041020456', '1557040976973795438'];
-
-const CLOSE_DELAY_MS = 24 * 60 * 60 * 1000; // กดปิดห้องแล้ว ต้องครบ 1 วัน (24 ชม.) เท่านั้นถึงส่ง log แล้วลบห้อง
-const CLOSE_DELAY_TEXT = '1 วัน (24 ชั่วโมง)';
-const AUTO_CLOSE_MS  = 24 * 60 * 60 * 1000; // ลูกค้าไม่พิมพ์ในตั๋วครบ 24 ชม. → ปิดอัตโนมัติ (ข้อความแอดมินไม่นับ)
 
 const PROMPTPAY_NUMBER = '0621473585'; // เบอร์พร้อมเพย์รับเงิน
-const SLIPOK_API_KEY   = process.env.SLIPOK_API_KEY;   // ⚠️ API Key จากหน้า SlipOK (slipok.com) ใส่ในไฟล์ .env
-const SLIPOK_BRANCH_ID = process.env.SLIPOK_BRANCH_ID; // ⚠️ Branch ID (รหัสสาขา) จาก SlipOK ใส่ในไฟล์ .env
-
-// ── ตรวจสลิปทรูมันนี่วอลเล็ต (ผ่าน EasySlip — easyslip.com) ──
-const EASYSLIP_API_KEY   = process.env.EASYSLIP_API_KEY;                          // ⚠️ API Key จาก EasySlip ใส่ในไฟล์ .env
-const TRUEWALLET_NUMBER  = process.env.TRUEWALLET_NUMBER || PROMPTPAY_NUMBER;     // เบอร์ทรูมันนี่วอลเล็ตของร้าน (ไม่ใส่ = ใช้เบอร์เดียวกับพร้อมเพย์)
 
 const QUEUE_FILE        = './queue.txt';
-const USED_SLIPS_FILE   = './used_slips.json';
 const TICKET_FILE       = './active_tickets.json';
 const REVIEW_COUNT_FILE = './review_count.json';
 
 // ==========================================
 // [ 4. Runtime State ]
 // ==========================================
-// activeTicketData[channelId] = {
-//   category, label, price, userId, qNum, payMethod, slipReceived, slipVerified, slipInfo,
-//   payments[], openedAt, lastActivityAt, panelMessageId, acceptedBy, acceptedAt,
-//   closeAt, closedBy, autoClosed, logged, closeTries
-// }
-let activeTicketData = {};
+let activeTicketData = {}; // activeTicketData[channelId] = { category, label, price, userId, qNum, payMethod }
 let queueCount         = 1;
 let reviewCount         = 0;
 
@@ -88,13 +63,6 @@ function saveTickets()     { fs.writeFileSync(TICKET_FILE, JSON.stringify(active
 function saveQueue()       { fs.writeFileSync(QUEUE_FILE, queueCount.toString()); }
 function saveReviewCount() { fs.writeFileSync(REVIEW_COUNT_FILE, JSON.stringify({ count: reviewCount })); }
 
-// เซฟแบบหน่วง (ใช้กับเวลาคุยล่าสุด จะได้ไม่เขียนไฟล์ทุกข้อความ)
-let saveTicketsTimer = null;
-function saveTicketsSoon() {
-    if (saveTicketsTimer) return;
-    saveTicketsTimer = setTimeout(() => { saveTicketsTimer = null; saveTickets(); }, 30 * 1000);
-}
-
 loadPersistentData();
 
 /** ลิงก์รูป QR Code พร้อมเพย์ตามยอดเงิน (PromptPay.io) */
@@ -116,263 +84,6 @@ function resolveChannelId(input) {
     return null;
 }
 
-// ── กันสลิปซ้ำข้ามห้อง (เก็บเลขอ้างอิงสลิปที่เคยรับแล้ว) ──
-let usedSlips = loadJSON(USED_SLIPS_FILE, {});
-function isSlipUsed(ref)   { return !!ref && !!usedSlips[String(ref)]; }
-function markSlipUsed(ref, info = {}) {
-    if (!ref || ref === '-') return;
-    usedSlips[String(ref)] = { ...info, at: Date.now() };
-    try { fs.writeFileSync(USED_SLIPS_FILE, JSON.stringify(usedSlips, null, 2)); }
-    catch (err) { console.error('❌ บันทึก used_slips.json ไม่ได้', err.message); }
-}
-
-/** เลขท้าย 4 ตัวของเบอร์ ใช้เทียบกับเบอร์ที่ทรูมันนี่ปิดบังไว้ (08x-xxx-4567) */
-function last4(phone) { return String(phone || '').replace(/\D/g, '').slice(-4); }
-
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-/** เทียบยอดเงินแบบกันทศนิยมเพี้ยน (150 = 150.00, 99.5 = 99.50) */
-function sameAmount(a, b) { return Math.abs(Number(a) - Number(b)) < 0.005; }
-
-/** ยอดเงินสำหรับแสดงผล: 150 → "150", 99.5 → "99.5", 1500 → "1,500" */
-function fmtAmount(n) {
-    return Number(n).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
-}
-
-/** รูปที่แนบมาเป็นรูปภาพไหม (มือถือบางเครื่องไม่ส่ง contentType มา จึงเช็คนามสกุลไฟล์ด้วย) */
-function isImageAttachment(a) {
-    if ((a.contentType || '').startsWith('image/')) return true;
-    return /\.(png|jpe?g|webp|gif|heic|heif)(\?|$)/i.test(a.name || a.url || '');
-}
-
-/** ดาวน์โหลดรูปสลิปจาก Discord เป็น Buffer — ส่งเป็นไฟล์ให้ API อ่านได้เสถียรกว่าส่งเป็นลิงก์ */
-async function downloadImage(imageUrl) {
-    try {
-        const res = await axios.get(imageUrl, { responseType: 'arraybuffer', timeout: 20000, maxContentLength: 15 * 1024 * 1024 });
-        return Buffer.from(res.data);
-    } catch (err) {
-        console.error('⚠️ โหลดรูปสลิปจาก Discord ไม่ได้ (จะส่งเป็นลิงก์แทน):', err.message);
-        return null;
-    }
-}
-
-function imageMime(buf) {
-    if (buf[0] === 0x89 && buf[1] === 0x50) return 'image/png';
-    if (buf[0] === 0xFF && buf[1] === 0xD8) return 'image/jpeg';
-    if (buf.slice(0, 4).toString() === 'RIFF') return 'image/webp';
-    return 'image/jpeg';
-}
-
-/** ส่งรูปแบบ multipart/form-data (ใช้ fetch/FormData ในตัว Node 18+) */
-async function postMultipart(url, headers, fields, fileFieldNames, buf) {
-    const form = new FormData();
-    for (const [k, v] of Object.entries(fields)) form.append(k, String(v));
-    const blob = new Blob([buf], { type: imageMime(buf) });
-    for (const name of fileFieldNames) form.append(name, blob, 'slip.jpg');
-
-    const res = await fetch(url, { method: 'POST', headers, body: form, signal: AbortSignal.timeout(25000) });
-    let data = null;
-    try { data = await res.json(); } catch (_) {}
-    return { status: res.status, data };
-}
-
-/** ส่ง JSON (ใช้ตอนโหลดรูปจาก Discord ไม่ได้ จึงส่งเป็นลิงก์แทน) */
-async function postJson(url, headers, body) {
-    const res = await axios.post(url, body, {
-        headers: { ...headers, 'Content-Type': 'application/json' },
-        timeout: 25000,
-        validateStatus: () => true
-    });
-    return { status: res.status, data: res.data };
-}
-
-/**
- * ตรวจสลิปทรูมันนี่วอลเล็ตผ่าน EasySlip API (POST /verify/truewallet)
- * ส่งเป็นไฟล์รูปก่อน ถ้าไม่ได้ผลค่อยส่งเป็นลิงก์ — สลิปที่ตัดต่อ/ปลอมจะไม่ผ่านการตรวจกับข้อมูลต้นทาง
- * ปิด checkDuplicate ฝั่ง EasySlip ไว้ เพราะ EasySlip จะนับสลิปว่า "ใช้แล้ว" ตั้งแต่ตรวจครั้งแรก
- * ทำให้สลิปจริงที่ยอดไม่ตรงแล้วแอดมินแก้ยอดให้ ส่งซ้ำแล้วโดนปฏิเสธผิดๆ — เรากันสลิปซ้ำเองด้วย used_slips.json (บันทึกเฉพาะสลิปที่รับยอดแล้ว)
- * @returns {Promise<{ok:boolean, reason:string, data?:object}>}
- */
-async function verifyTrueWalletSlip(imageUrl, buf, expectedAmount) {
-    if (!EASYSLIP_API_KEY) return { ok: false, reason: 'NO_TW_KEY' };
-
-    const endpoint = 'https://api.easyslip.com/v2/verify/truewallet';
-    const auth     = { Authorization: `Bearer ${EASYSLIP_API_KEY}` };
-    const modes    = buf ? ['file', 'url'] : ['url'];
-
-    let body = null;
-    let networkFail = false;
-
-    for (const mode of modes) {
-        try {
-            const r = mode === 'file'
-                ? await postMultipart(endpoint, auth, { checkDuplicate: 'false' }, ['file', 'image'], buf)
-                : await postJson(endpoint, auth, { url: imageUrl, checkDuplicate: false });
-
-            if (r.status === 401 || r.status === 403) return { ok: false, reason: 'TW_AUTH' };
-            body = r.data;
-            networkFail = r.status === 429 || r.status >= 500;
-            if (body?.success && body.data?.rawSlip) break;
-        } catch (err) {
-            console.error('❌ EasySlip API Error:', err.message);
-            networkFail = true;
-        }
-    }
-
-    if (!(body?.success && body.data?.rawSlip)) {
-        return { ok: false, reason: networkFail ? 'NETWORK_ERROR' : 'TW_NOT_VERIFIED' };
-    }
-
-    const d    = body.data;
-    const slip = d.rawSlip;
-    const norm = {
-        transRef: String(slip.transactionId ?? '-'),
-        amount:   Number(slip.amount ?? d.amountInSlip),
-        sender:   { displayName: slip.sender?.name ?? 'ไม่ทราบชื่อ' },
-        receiver: slip.receiver || {},
-        date:     slip.date,
-        source:   'TrueMoney Wallet'
-    };
-
-    if (!norm.transRef || norm.transRef === '-' || isNaN(norm.amount)) return { ok: false, reason: 'TW_NOT_VERIFIED' };
-    if (expectedAmount > 0 && !sameAmount(norm.amount, expectedAmount)) return { ok: false, reason: '1013', data: norm };
-    // เบอร์ผู้รับต้องตรงกับเบอร์ทรูมันนี่ของร้าน (เทียบเลขท้าย 4 ตัว เพราะสลิปปิดบังเบอร์)
-    if (norm.receiver.phone && last4(norm.receiver.phone) !== last4(TRUEWALLET_NUMBER)) {
-        return { ok: false, reason: '1014', data: norm };
-    }
-
-    return { ok: true, reason: 'VERIFIED', data: norm };
-}
-
-/**
- * ตรวจสอบสลิปธนาคารผ่าน SlipOK API (https://slipok.com) — รองรับทุกธนาคารที่ SlipOK รองรับ
- * ส่งรูปเป็นไฟล์ก่อน (เสถียรสุด) ถ้าส่งไฟล์ไม่ได้/รูปมีปัญหาค่อยลองส่งเป็นลิงก์
- * @returns {Promise<{ok:boolean, reason:string, data?:object}>}
- */
-async function verifySlip(imageUrl, buf, expectedAmount) {
-    if (!SLIPOK_API_KEY || !SLIPOK_BRANCH_ID) {
-        return { ok: false, reason: 'NO_API_KEY' };
-    }
-
-    const endpoint = `https://api.slipok.com/api/line/apikey/${SLIPOK_BRANCH_ID}`;
-    const headers  = { 'x-authorization': SLIPOK_API_KEY };
-    const amountField = expectedAmount > 0 ? { amount: expectedAmount } : {};
-    const modes = buf ? ['file', 'url'] : ['url'];
-
-    let last = { ok: false, reason: 'NETWORK_ERROR' };
-
-    for (const mode of modes) {
-        try {
-            const r = mode === 'file'
-                ? await postMultipart(endpoint, headers, { log: 'true', ...amountField }, ['files'], buf)
-                : await postJson(endpoint, headers, { url: imageUrl, log: true, ...amountField });
-
-            const body = r.data;
-            if (body?.success && body.data) {
-                const slip = body.data;
-                // เช็กยอดซ้ำอีกชั้น เผื่อ API ไม่ได้ตรวจให้
-                if (expectedAmount > 0 && !sameAmount(slip.amount, expectedAmount)) {
-                    return { ok: false, reason: '1013', data: slip };
-                }
-                return { ok: true, reason: 'VERIFIED', data: slip };
-            }
-
-            if (body?.code) last = { ok: false, reason: String(body.code), data: body.data };
-            else last = { ok: false, reason: (r.status === 429 || r.status >= 500) ? 'NETWORK_ERROR' : 'UNKNOWN_ERROR' };
-        } catch (err) {
-            console.error('❌ SlipOK API Error:', err.message);
-            last = { ok: false, reason: 'NETWORK_ERROR' };
-        }
-
-        // ลองวิธีถัดไปเฉพาะกรณีส่งรูปมีปัญหา/ระบบล่ม ไม่ใช่ผลตรวจที่ชัดเจนแล้ว
-        if (!['NETWORK_ERROR', 'UNKNOWN_ERROR', '1005', '1006'].includes(last.reason)) break;
-    }
-    return last;
-}
-
-/**
- * ตรวจสลิปได้ทั้งธนาคาร (ทุกธนาคาร) และทรูมันนี่วอลเล็ต
- *  1) ตรวจเป็นสลิปธนาคารผ่าน SlipOK ก่อน
- *  2) ถ้าไม่ผ่านและไม่ใช่ผลที่ชัดเจน (สลิปซ้ำ/ยอดไม่ตรง/บัญชีผู้รับไม่ตรง) → ลองตรวจเป็นสลิปทรูมันนี่ต่อ
- *  3) กันสลิปซ้ำที่เคยรับไปแล้ว ไม่ว่าห้องไหน
- * สลิปปลอม/ตัดต่อจะไม่ผ่านการตรวจกับข้อมูลต้นทาง จึงถูกปฏิเสธทุกกรณี
- */
-async function verifyAnySlip(imageUrl, expectedAmount) {
-    const buf = await downloadImage(imageUrl);
-
-    const bank = await verifySlip(imageUrl, buf, expectedAmount);
-    let result = bank;
-
-    const DEFINITIVE = ['1012', '1013', '1014'];
-    if (!bank.ok && !DEFINITIVE.includes(bank.reason) && EASYSLIP_API_KEY) {
-        const tw = await verifyTrueWalletSlip(imageUrl, buf, expectedAmount);
-
-        if (tw.ok || ['1013', '1014', 'TW_DUPLICATE'].includes(tw.reason)) {
-            result = tw;
-        } else if (tw.reason === 'TW_NOT_VERIFIED') {
-            // ไม่ผ่านทั้งสองระบบ: ถ้าฝั่งธนาคารบอกว่าเป็นปัญหารูป/ระบบ ให้คงข้อความนั้นไว้ ไม่งั้นถือว่าตรวจไม่ผ่าน
-            const KEEP_BANK = ['1005', '1006', '1007', '1008', 'NO_API_KEY', '1002', '1003', '1004', '1009', '1010', 'NETWORK_ERROR'];
-            result = KEEP_BANK.includes(bank.reason) ? bank : { ok: false, reason: 'NOT_VERIFIED' };
-        } else {
-            result = tw; // NETWORK_ERROR / TW_AUTH
-        }
-    }
-
-    if (result.ok) {
-        const ref = result.data?.transRef;
-        if (isSlipUsed(ref)) return { ok: false, reason: '1012', data: result.data };
-        result.data.source = result.data.source || 'ธนาคาร';
-    }
-    return result;
-}
-
-/**
- * ตรวจสลิปพร้อมลองซ้ำอัตโนมัติ — สลิปจริงที่เพิ่งโอนอาจยังไม่เข้าระบบธนาคาร (1009/1010/1011)
- * หรือเน็ตสะดุด จึงรอแล้วตรวจใหม่เอง ลูกค้าไม่ต้องส่งซ้ำ (สลิปปลอมก็ยังไม่ผ่านอยู่ดี)
- */
-const RETRY_MAX    = { '1009': 3, '1010': 3, '1011': 2, NOT_VERIFIED: 2, NETWORK_ERROR: 3 };
-const RETRY_DELAYS = [5000, 10000, 20000];
-
-async function verifyWithRetry(imageUrl, expectedAmount, onRetry) {
-    for (let attempt = 0; ; attempt++) {
-        const result = await verifyAnySlip(imageUrl, expectedAmount);
-        const max = result.ok ? 0 : (RETRY_MAX[result.reason] || 0);
-        if (attempt >= max) return result;
-
-        if (onRetry) await onRetry(attempt + 1);
-        await sleep(RETRY_DELAYS[Math.min(attempt, RETRY_DELAYS.length - 1)]);
-    }
-}
-
-/** แปลงรหัสข้อผิดพลาดเป็นข้อความภาษาไทยที่เข้าใจง่าย (ctx = ข้อมูลเสริม เช่น ยอดที่ต้องชำระ) */
-function slipErrorMessage(reason, ctx = {}) {
-    const map = {
-        NO_API_KEY: 'ยังไม่ได้ตั้งค่าระบบตรวจสลิปอัตโนมัติ (SLIPOK_API_KEY / SLIPOK_BRANCH_ID) — รอแอดมินตรวจสอบด้วยตนเองนะครับ',
-        '1002':     'ระบบตรวจสลิปตั้งค่าไม่ถูกต้อง (API Key ผิด) — รอแอดมินตรวจสอบด้วยตนเองนะครับ',
-        '1003':     'แพ็กเกจระบบตรวจสลิปหมดอายุ — รอแอดมินตรวจสอบด้วยตนเองนะครับ',
-        '1004':     'โควต้าตรวจสลิปหมด — รอแอดมินตรวจสอบด้วยตนเองนะครับ',
-        '1005':     'ไฟล์ที่ส่งมาไม่ใช่รูปภาพที่ถูกต้อง กรุณาส่งใหม่เป็นไฟล์ JPG/PNG',
-        '1006':     'รูปภาพไม่ถูกต้อง กรุณาส่งรูปสลิปใหม่อีกครั้ง',
-        '1007':     'ไม่พบ QR Code ในรูปภาพ กรุณาส่งรูปสลิปที่เห็น QR ชัดเจนอีกครั้ง (ส่งรูปเต็มๆ ไม่ครอป)',
-        '1008':     'QR Code ในรูปไม่ใช่สลิปโอนเงิน กรุณาส่งรูปสลิปที่ถูกต้อง',
-        '1009':     'ธนาคารยังไม่ตอบสนอง กรุณารอสักครู่แล้วส่งสลิปใหม่อีกครั้ง',
-        '1010':     'สลิปยังไม่เข้าระบบธนาคาร กรุณารอประมาณ 5 นาทีแล้วส่งใหม่อีกครั้ง',
-        '1011':     'ไม่พบข้อมูลสลิปนี้ หรือ QR Code หมดอายุ กรุณาตรวจสอบแล้วส่งใหม่อีกครั้ง',
-        '1012':     'สลิปนี้เคยถูกใช้ยืนยันการชำระเงินไปแล้ว ไม่สามารถใช้ซ้ำได้ กรุณาติดต่อแอดมิน',
-        '1013':     ctx.slipAmount != null && ctx.expected != null
-            ? `ยอดเงินในสลิปไม่ตรงกับยอดที่ต้องชำระ (สลิป ${fmtAmount(ctx.slipAmount)} บาท / ต้องชำระ ${fmtAmount(ctx.expected)} บาท) กรุณาโอนให้ครบ หรือแจ้งแอดมิน`
-            : 'ยอดเงินในสลิปไม่ตรงกับยอดที่ต้องชำระ กรุณาตรวจสอบและโอนให้ครบ หรือแจ้งแอดมิน',
-        '1014':     'บัญชีผู้รับในสลิปไม่ตรงกับบัญชีของร้าน กรุณาตรวจสอบว่าโอนถูกบัญชี หรือแจ้งแอดมิน',
-        TW_DUPLICATE:   'สลิปนี้เคยถูกใช้ยืนยันการชำระเงินไปแล้ว ไม่สามารถใช้ซ้ำได้ กรุณาติดต่อแอดมิน',
-        TW_NOT_VERIFIED: 'ตรวจสอบสลิปทรูมันนี่ไม่ผ่าน กรุณาส่งสลิปจริงที่เห็นรายละเอียดชัดเจน หรือแจ้งแอดมิน',
-        NOT_VERIFIED:   'ตรวจสอบสลิปไม่ผ่าน ไม่พบรายการโอนนี้ในระบบ (อาจเป็นสลิปปลอม/ตัดต่อ) กรุณาส่งสลิปจริง หรือแจ้งแอดมิน',
-        NO_TW_KEY:      'ยังไม่ได้ตั้งค่าระบบตรวจสลิปทรูมันนี่ — รอแอดมินตรวจสอบด้วยตนเองนะครับ',
-        TW_AUTH:        'ระบบตรวจสลิปทรูมันนี่ตั้งค่าไม่ถูกต้อง (API Key ผิด) — รอแอดมินตรวจสอบด้วยตนเองนะครับ',
-        NETWORK_ERROR: 'ระบบตรวจสลิปขัดข้องชั่วคราว รอแอดมินตรวจสอบด้วยตนเองนะครับ'
-    };
-    return map[reason] || 'ตรวจสอบสลิปไม่สำเร็จ กรุณาลองส่งใหม่อีกครั้ง หรือรอแอดมินตรวจสอบด้วยตนเอง';
-}
-
 /** แทนที่/เติมเลขรีวิวในชื่อห้อง รูปแบบ 〔1074〕 — ไม่แตะข้อความอื่นในชื่อห้อง */
 function buildReviewChannelName(currentName, count) {
     if (/〔\d+〕/.test(currentName)) {
@@ -381,83 +92,9 @@ function buildReviewChannelName(currentName, count) {
     return `${currentName}〔${count}〕`;
 }
 
-// ── อิโมจิ ──
-function findEmoji(id) {
-    return client.emojis.cache.get(id) ?? client.application?.emojis?.cache?.get(id) ?? null;
-}
-
-const warnedEmoji = new Set();
-function warnEmojiOnce(id, where) {
-    if (warnedEmoji.has(id)) return;
-    warnedEmoji.add(id);
-    console.error(`⚠️ ไม่พบอิโมจิไอดี ${id} (${where}) — อิโมจิต้องอยู่ในเซิร์ฟเวอร์ที่บอทอยู่ หรืออัปโหลดเป็น Application Emoji`);
-}
-
-/** อิโมจิสำหรับปุ่ม: ใช้อิโมจิเซิร์ฟเวอร์ถ้าหาเจอ ไม่งั้นใช้ fallback (อิโมจิธรรมดา) */
-function buttonEmoji(id, fallback) {
-    const e = findEmoji(id);
-    if (!e) { warnEmojiOnce(id, 'ปุ่ม'); return fallback; }
-    return { id: e.id, name: e.name, animated: e.animated };
-}
-
-// ── กดรีแอคชั่นข้อความในห้องรีวิว (ข้ามอันที่บอทเคยกดแล้ว) ──
-const reactErrorLogged = new Set();
-
-async function reactToReview(message) {
-    if (message.system) return false;
-    let added = false;
-
-    for (const id of REVIEW_REACTION_IDS) {
-        if (message.reactions.cache.some(r => r.emoji.id === id && r.me)) continue; // เคยกดแล้ว
-
-        const emoji = findEmoji(id);
-        if (!emoji) { warnEmojiOnce(id, 'รีแอคชั่น'); continue; }
-
-        try {
-            await message.react(emoji);
-            added = true;
-        } catch (err) {
-            if (err.code === 10008) return added; // ข้อความถูกลบไปแล้ว
-            const key = String(err.code ?? err.message);
-            if (!reactErrorLogged.has(key)) { // log ครั้งเดียวต่อชนิด error จะได้ไม่ท่วม Console
-                reactErrorLogged.add(key);
-                console.error('❌ กดรีแอคชั่นไม่ได้ (เช็คสิทธิ์ Add Reactions / Read Message History / Use External Emojis ของบอทในห้องรีวิว):', err.message);
-            }
-        }
-    }
-    return added;
-}
-
-/** ไล่กดรีแอคชั่นย้อนหลังทุกข้อความในห้องรีวิว (ทำเบื้องหลังตอนบอทเริ่มรัน) */
-async function backfillReviewReactions() {
-    const channel = await client.channels.fetch(REVIEW_CHANNEL_ID);
-    if (!channel?.messages) {
-        console.error('❌ ห้องรีวิวไม่ใช่ห้องข้อความ ย้อนกดรีแอคชั่นไม่ได้');
-        return;
-    }
-
-    let before;
-    let scanned = 0, reacted = 0;
-    console.log('⏳ เริ่มย้อนกดรีแอคชั่นห้องรีวิว (ข้อความที่เคยกดแล้วจะข้าม)...');
-
-    while (true) {
-        const batch = await channel.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
-        if (batch.size === 0) break;
-
-        for (const msg of batch.values()) {
-            scanned++;
-            if (await reactToReview(msg)) reacted++;
-        }
-        before = batch.last().id; // ข้อความเก่าสุดในชุดนี้ ใช้ดึงชุดถัดไป
-    }
-
-    console.log(`✅ ย้อนกดรีแอคชั่นห้องรีวิวเสร็จ: สแกน ${scanned} ข้อความ / กดเพิ่ม ${reacted} ข้อความ`);
-}
-
-// ── ปิดตั๋ว: รอครบ 1 วัน → ส่ง log สรุปลูกค้าเข้าห้อง log → ลบห้องตั๋วทิ้ง ──
+// ── ปิดตั๋ว: รอ 10 นาที แล้วย้ายเข้าหมวดเก็บงาน + ซ่อนห้องจากลูกค้า ──
+const CLOSE_DELAY_MS = 10 * 60 * 1000;
 const closeTimers    = new Map(); // channelId -> timeout
-const creatingTicket = new Set(); // userId ที่กำลังสร้างตั๋วอยู่ (กันกดรัว)
-const slipChecking   = new Set(); // channelId ที่กำลังตรวจสลิปอยู่ (กันตรวจชนกัน)
 
 function scheduleClose(channelId, delayMs) {
     if (closeTimers.has(channelId)) return;
@@ -468,155 +105,24 @@ function scheduleClose(channelId, delayMs) {
     closeTimers.set(channelId, timer);
 }
 
-/** เริ่มนับถอยหลังปิดตั๋ว (บันทึกลงไฟล์ เผื่อบอทรีสตาร์ท) — คืน false ถ้าตั๋วนี้ปิดไปแล้ว/ไม่ใช่ตั๋ว */
-function beginClose(channelId, { closedBy = null, auto = false } = {}) {
-    const data = activeTicketData[channelId];
-    if (!data || data.category !== 'ticket' || data.closeAt) return false;
-
-    data.closeAt    = Date.now() + CLOSE_DELAY_MS;
-    data.closedBy   = closedBy;
-    data.autoClosed = auto;
-    saveTickets();
-    scheduleClose(channelId, CLOSE_DELAY_MS);
-    return true;
-}
-
-/** เอมเบดข้อความตอนปิดห้อง */
-function buildCloseEmbed(auto) {
-    const head = auto
-        ? `ห้องนี้ถูกปิดอัตโนมัติ เนื่องจากลูกค้าไม่ตอบกลับในห้องครบ ${AUTO_CLOSE_MS / 3600000} ชั่วโมง\nห้องนี้จะถูกลบเมื่อครบ ${CLOSE_DELAY_TEXT} นับจากตอนนี้ (ถ้ายังต้องการใช้บริการ เปิดตั๋วใหม่ได้หลังห้องนี้ถูกลบครับ)`
-        : `ห้องนี้ถูกปิดแล้วครับ ห้องนี้จะถูกลบเมื่อครบ ${CLOSE_DELAY_TEXT} นับจากตอนนี้`;
-
-    return new EmbedBuilder()
-        .setColor('#2ECC71')
-        .setTitle('✅ ปิดห้องแล้ว')
-        .setDescription(
-`${head}
-
-เมื่อ ADMIN กดของเสร็จแล้ว ลูกค้าอย่าลืมเปลี่ยน Password เพื่อความปลอดภัยของตัวลูกค้าเองนะคั้บบ
-
-💖 ขอบคุณที่ใช้บริการครับ ฝากรีวิวได้ที่ <#${REVIEW_CHANNEL_ID}>`
-        );
-}
-
-/** ส่ง log สรุปว่าลูกค้าคนนี้ทำรายการอะไรไปบ้าง เข้าห้อง LOG_CHANNEL_ID
- *  (ตั้งใจไม่เก็บข้อความแชทของลูกค้า เพราะอาจมีรหัสผ่าน/ข้อมูลส่วนตัวปนอยู่) */
-async function sendTicketLog(data) {
-    const ts = (ms) => `<t:${Math.floor(ms / 1000)}:F>`;
-
-    let username = 'ไม่ทราบ';
-    if (data.userId) {
-        const user = await client.users.fetch(data.userId).catch(() => null);
-        if (user) username = user.username;
-    }
-
-    // สรุปการชำระเงิน
-    const payments = data.payments ?? [];
-    let payText;
-    if (payments.length > 0) {
-        payText = payments.slice(0, 10).map(p =>
-            `• **${Number(p.amount).toLocaleString()} บาท** — ผู้โอน: ${p.sender} — อ้างอิง: \`${p.transRef}\``
-        ).join('\n');
-    } else if (data.slipReceived) {
-        payText = '⏳ ลูกค้าส่งสลิปมา แต่ระบบตรวจอัตโนมัติใช้ไม่ได้ (ให้แอดมินตรวจเอง)';
-    } else if (data.price > 0) {
-        payText = `แจ้งยอด ${Number(data.price).toLocaleString()} บาท แต่ยังไม่มีการชำระ`;
-    } else {
-        payText = 'ไม่มีการแจ้งยอด / ไม่มีการชำระเงิน';
-    }
-
-    const embed = new EmbedBuilder()
-        .setColor('#2B2D31')
-        .setTitle(`📋 Log ตั๋ว #${data.qNum}`)
-        .addFields(
-            { name: '👤 ลูกค้า',        value: data.userId ? `<@${data.userId}> (${username})\n\`${data.userId}\`` : 'ไม่ทราบ', inline: true },
-            { name: '🎫 ตั๋ว',          value: `#${data.qNum}`, inline: true },
-            { name: '🕒 เปิดเมื่อ',      value: data.openedAt ? ts(data.openedAt) : 'ไม่ทราบ', inline: false },
-            { name: '🛠️ รับงานโดย',     value: data.acceptedBy ? `<@${data.acceptedBy}>` : 'ไม่มีผู้รับงาน', inline: true },
-            { name: '🔒 ปิดโดย',        value: data.closedBy ? `<@${data.closedBy}>` : (data.autoClosed ? 'ระบบอัตโนมัติ (ลูกค้าไม่ตอบ 24 ชม.)' : 'ไม่ทราบ'), inline: true },
-            { name: '💰 รายการชำระเงิน', value: payText.slice(0, 1024), inline: false }
-        )
-        .setTimestamp();
-
-    try {
-        const logChannel = await client.channels.fetch(LOG_CHANNEL_ID);
-        await logChannel.send({ embeds: [embed] });
-    } catch (err) {
-        console.error('❌ ส่ง log เข้าห้อง LOG_CHANNEL_ID ไม่ได้ (เช็คไอดีห้อง และสิทธิ์ View/Send ของบอท):', err.message);
-        console.log('📋 LOG สำรอง:', JSON.stringify(data));
-    }
-}
-
 async function closeTicket(channelId) {
-    const data = activeTicketData[channelId];
-    if (!data || data.category !== 'ticket') return; // กันลบห้องที่ไม่ใช่ห้องตั๋ว
+    const data   = activeTicketData[channelId];
+    const userId = data?.userId;
 
-    // กันพลาด: ยังไม่ครบเวลาปิดห้อง (1 วัน) ห้ามลบเด็ดขาด — เลื่อนไปรอจนครบ
-    if (!data.closeAt || Date.now() < data.closeAt) {
-        if (data.closeAt) scheduleClose(channelId, data.closeAt - Date.now());
-        return;
-    }
-
-    // 1) ส่ง log (ครั้งเดียว ถึงลบห้องไม่สำเร็จแล้วลองใหม่ก็ไม่ส่งซ้ำ)
-    if (!data.logged) {
-        await sendTicketLog(data);
-        data.logged = true;
-        saveTickets();
-    }
-
-    // 2) ลบห้องตั๋ว
     try {
         const chan = await client.channels.fetch(channelId);
-        await chan.delete(`ตั๋ว #${data.qNum} ครบเวลาปิดห้อง 1 วัน`);
-        console.log(`🗑️ ลบตั๋ว #${data.qNum} เรียบร้อย`);
+        await chan.setParent(DONE_CATEGORY_ID, { lockPermissions: false });
+        if (userId) await chan.permissionOverwrites.edit(userId, { ViewChannel: false });
+        console.log(`📦 ตั๋ว #${data?.qNum ?? '?'} ย้ายเข้าหมวดเก็บงานและซ่อนจากลูกค้าแล้ว`);
     } catch (err) {
         if (err.code !== 10003) { // 10003 = Unknown Channel (ห้องถูกลบไปแล้ว ก็ถือว่าเสร็จ)
-            data.closeTries = (data.closeTries || 0) + 1;
-            saveTickets();
-            console.error(`❌ ลบตั๋ว #${data.qNum} ไม่สำเร็จ (เช็คสิทธิ์ Manage Channels ของบอท):`, err.message);
-            if (data.closeTries < 5) scheduleClose(channelId, 2 * 60 * 1000); // ลองใหม่ใน 2 นาที
-            return;
+            console.error(`❌ ย้าย/ซ่อนตั๋ว ${channelId} ไม่สำเร็จ (เช็ค DONE_CATEGORY_ID, สิทธิ์ Manage Channels, หมวดเต็ม 50 ห้อง):`, err.message);
+            return; // เก็บข้อมูลไว้ จะลองใหม่ตอนบอทเริ่มรันครั้งถัดไป
         }
     }
 
     delete activeTicketData[channelId];
     saveTickets();
-}
-
-/** ปิดตั๋วอัตโนมัติเมื่อไม่มีใครตอบในห้องครบ 24 ชม. */
-async function autoCloseTicket(channelId) {
-    const data = activeTicketData[channelId];
-    if (!beginClose(channelId, { closedBy: null, auto: true })) return;
-
-    const chan = await client.channels.fetch(channelId).catch(() => null);
-    if (!chan) return; // ห้องหาย — ตัวจับเวลา/ChannelDelete จะเคลียร์เอง
-
-    if (data.panelMessageId) {
-        chan.messages.fetch(data.panelMessageId).then(m => m.edit({ components: [] })).catch(() => {});
-    }
-    await chan.send({
-        content: data.userId ? `<@${data.userId}>` : undefined,
-        embeds: [buildCloseEmbed(true)]
-    }).catch(() => {});
-    chan.setName(`✅-${data.qNum}`).catch(() => {});
-}
-
-async function checkInactiveTickets() {
-    const now = Date.now();
-    for (const [channelId, data] of Object.entries(activeTicketData)) {
-        if (data.category !== 'ticket' || data.closeAt) continue;
-
-        const last = data.lastActivityAt ?? data.openedAt;
-        if (!last) { // ตั๋วเก่าที่ยังไม่มีบันทึกเวลา → เริ่มนับจากตอนนี้
-            data.lastActivityAt = now;
-            saveTickets();
-            continue;
-        }
-        if (now - last >= AUTO_CLOSE_MS) {
-            console.log(`⏰ ตั๋ว #${data.qNum} ลูกค้าไม่ตอบครบ 24 ชม. → ปิดอัตโนมัติ`);
-            await autoCloseTicket(channelId);
-        }
-    }
 }
 
 // ── เปลี่ยนชื่อห้องรีวิว: Discord จำกัดการเปลี่ยนชื่อห้อง 2 ครั้ง/10 นาที
@@ -654,14 +160,10 @@ const client = new Client({
 client.once(Events.ClientReady, async () => {
     console.log(`✅ ล็อกอินแล้ว: ${client.user.tag}`);
 
-    // กู้ตัวจับเวลาปิดตั๋วที่ค้างอยู่ (เผื่อบอทรีสตาร์ทระหว่างรอ 1 วัน)
+    // กู้ตัวจับเวลาปิดตั๋วที่ค้างอยู่ (เผื่อบอทรีสตาร์ทระหว่างรอ 10 นาที)
     for (const [channelId, data] of Object.entries(activeTicketData)) {
         if (data.closeAt) scheduleClose(channelId, data.closeAt - Date.now());
     }
-
-    // ตรวจตั๋วที่เงียบครบ 24 ชม. ทุก 5 นาที
-    checkInactiveTickets().catch(err => console.error('❌ checkInactiveTickets:', err));
-    setInterval(() => checkInactiveTickets().catch(err => console.error('❌ checkInactiveTickets:', err)), 5 * 60 * 1000);
 
     // ซิงค์เลขรีวิวจากชื่อห้อง (กันนับใหม่จาก 0 ทับเลขเดิม) + ตรวจว่าบอทเข้าถึงห้องรีวิวได้
     try {
@@ -675,30 +177,12 @@ client.once(Events.ClientReady, async () => {
     } catch (err) {
         console.error('❌ บอทเข้าถึงห้องรีวิวไม่ได้ — เช็ค REVIEW_CHANNEL_ID ว่าถูกเซิร์ฟเวอร์ และบอทเห็นห้องนี้:', err.message);
     }
-
-    // โหลดอิโมจิของแอป (ถ้ามี) แล้วย้อนกดรีแอคชั่นทุกข้อความเก่าในห้องรีวิว (ทำเบื้องหลัง ไม่ขวางบอท)
-    await client.application?.emojis?.fetch().catch(() => {});
-    backfillReviewReactions().catch(err => console.error('❌ ย้อนกดรีแอคชั่นห้องรีวิวไม่สำเร็จ:', err.message));
-});
-
-// ห้องตั๋วถูกลบ (โดยบอทหรือแอดมินลบมือ) → เคลียร์ข้อมูล ลูกค้าจะได้เปิดตั๋วใหม่ได้
-client.on(Events.ChannelDelete, (channel) => {
-    if (!activeTicketData[channel.id]) return;
-    const timer = closeTimers.get(channel.id);
-    if (timer) { clearTimeout(timer); closeTimers.delete(channel.id); }
-    delete activeTicketData[channel.id];
-    saveTickets();
 });
 
 // ==========================================
-// [ 7. Message Handler: คำสั่งแอดมิน + ตรวจจับสลิป + นับรีวิว ]
+// [ 7. Message Handler: คำสั่งแอดมิน + นับรีวิว ]
 // ==========================================
 client.on('messageCreate', async (message) => {
-    // ── กดรีแอคชั่นทุกข้อความใหม่ในห้องรีวิว (เช็คก่อนกรองบอท เพื่อให้ได้ทุกข้อความ ยกเว้นของบอทเราเอง) ──
-    if (message.guild && message.channel.id === REVIEW_CHANNEL_ID && message.author.id !== client.user.id) {
-        reactToReview(message); // ไม่ await เพื่อไม่ขวางการนับรีวิว (ฟังก์ชันจับ error เองแล้ว)
-    }
-
     if (!message.guild || message.author.bot) return;
 
     // ── ระบบนับรีวิว (เช็คก่อนคำสั่ง เพื่อให้รีวิวที่ขึ้นต้นด้วย ! ก็นับ) ──
@@ -712,13 +196,6 @@ client.on('messageCreate', async (message) => {
             scheduleReviewRename();
             return;
         }
-    }
-
-    // ── บันทึกเวลาที่ "ลูกค้า" พิมพ์ล่าสุดในตั๋ว ไว้ใช้ปิดอัตโนมัติ 24 ชม. (แอดมินพิมพ์/แท็กไม่นับ) ──
-    const activity = activeTicketData[message.channel.id];
-    if (activity && activity.category === 'ticket' && !activity.closeAt && message.author.id === activity.userId) {
-        activity.lastActivityAt = Date.now();
-        saveTicketsSoon();
     }
 
     // ── คำสั่งแอดมิน (เช็คก่อนเสมอ แม้จะพิมพ์ในห้องตั๋วก็ใช้ได้) ──────
@@ -758,7 +235,7 @@ client.on('messageCreate', async (message) => {
 
         // !qr [ยอดเงิน] [ห้องปลายทาง]  → สร้าง QR พร้อมเพย์ยอดที่ระบุ ส่งไปห้องไหนก็ได้
         if (command === '!qr') {
-            const amount   = Math.round(parseFloat(String(args[1] ?? '').replace(/,/g, '')) * 100) / 100;
+            const amount   = parseFloat(args[1]);
             const targetId = resolveChannelId(args[2]);
 
             if (isNaN(amount) || amount <= 0)
@@ -775,17 +252,13 @@ client.on('messageCreate', async (message) => {
             let qNum = existing?.qNum;
             if (!qNum) { qNum = queueCount++; saveQueue(); }
 
-            // ...existing เพื่อคงข้อมูลตั๋วเดิมไว้ (เวลาเปิด, ผู้รับงาน, ประวัติชำระเงิน ฯลฯ)
             activeTicketData[targetId] = {
-                ...existing,
                 category:     existing?.category ?? 'manual',
                 label:        existing?.label ?? 'ชำระเงิน',
                 price:        amount,
                 userId:       existing?.userId ?? null,
                 qNum,
-                payMethod:    'promptpay',
-                slipReceived: false,
-                slipVerified: false
+                payMethod:    'promptpay'
             };
             saveTickets();
 
@@ -793,132 +266,30 @@ client.on('messageCreate', async (message) => {
                 .setTitle('🧾 แจ้งยอดชำระเงิน')
                 .setColor('#2ECC71')
                 .setDescription(
-`💰 ยอดชำระ: **${fmtAmount(amount)} บาท**
+`💰 ยอดชำระ: **${amount.toLocaleString()} บาท**
 
 📌 สแกน QR พร้อมเพย์ด้านล่างนี้ หรือโอนมาที่เบอร์: \`${PROMPTPAY_NUMBER}\`
 
-📸 **เมื่อโอนเสร็จแล้ว ให้ส่งรูปสลิปลงในห้องนี้ได้เลยครับ!**`
+📸 **เมื่อโอนเสร็จแล้ว ให้ส่งรูปสลิปลงในห้องนี้ แล้วรอแอดมินตรวจสอบสักครู่นะครับ**`
                 )
                 .setImage(buildQrUrl(amount))
-                .setFooter({ text: 'เมื่อส่งสลิปแล้ว บอทจะตรวจสอบและตอบกลับอัตโนมัติ' });
+                .setFooter({ text: 'แอดมินจะตรวจสอบสลิปและดำเนินการให้ครับ' });
 
             await targetChannel.send({ embeds: [qrEmbed] });
-            return message.reply(`✅ สร้าง QR ยอด **${fmtAmount(amount)} บาท** ส่งไปที่ ${targetChannel} แล้วครับ`);
+            return message.reply(`✅ สร้าง QR ยอด **${amount.toLocaleString()} บาท** ส่งไปที่ ${targetChannel} แล้วครับ`);
         }
 
         return;
     }
 
-    // ── ตรวจจับ + ตรวจสอบสลิปอัตโนมัติ (ห้องไหนก็ได้ที่มีการแจ้งยอดด้วย !qr หรือเป็นห้องตั๋ว) ──
-    const ticketData = activeTicketData[message.channel.id];
-    if (ticketData) {
-        const isAdmin = !!message.member?.roles.cache.has(ADMIN_ROLE_ID);
-        const images  = [...message.attachments.values()].filter(isImageAttachment);
-
-        if (ticketData.price > 0 && !isAdmin && images.length > 0 && !ticketData.slipVerified) {
-            // กันส่งสลิปรัวๆ แล้วตรวจชนกัน (จะได้ไม่รับยอดซ้ำ)
-            if (slipChecking.has(message.channel.id)) {
-                return message.reply('⏳ กำลังตรวจสลิปก่อนหน้าอยู่ กรุณารอสักครู่นะครับ').catch(() => {});
-            }
-            slipChecking.add(message.channel.id);
-
-            try {
-                const checkingMsg = await message.reply('🔍 กำลังตรวจสอบสลิป กรุณารอสักครู่นะครับ...');
-                const expected    = ticketData.price;
-
-                // ส่งมาหลายรูป → ลองทุกรูปจนเจอรูปที่ผ่าน
-                let result = null;
-                for (const img of images) {
-                    const r = await verifyWithRetry(img.url, expected, (n) =>
-                        checkingMsg.edit({ content: `🔍 ยังตรวจไม่เจอข้อมูลสลิป กำลังตรวจซ้ำให้อัตโนมัติ (ครั้งที่ ${n})...` }).catch(() => {})
-                    );
-                    if (r.ok) { result = r; break; }
-                    // รูปที่ไม่ใช่สลิป (แคปแชท ฯลฯ) ไม่ให้ทับผลของรูปสลิปจริง
-                    if (!result || !['1005', '1006', '1007', '1008'].includes(r.reason)) result = r;
-                }
-
-                if (result.ok) {
-                    ticketData.slipVerified = true;
-                    ticketData.slipReceived = true;
-                    ticketData.slipInfo = {
-                        transRef: result.data.transRef ?? '-',
-                        source:   result.data.source || 'ธนาคาร',
-                        amount:   Number(result.data.amount) || expected,
-                        sender:   result.data.sender?.displayName ?? result.data.sender?.name ?? 'ไม่ทราบชื่อ'
-                    };
-                    // เก็บประวัติการชำระเงินไว้สรุปใน log ตอนปิดตั๋ว
-                    if (!Array.isArray(ticketData.payments)) ticketData.payments = [];
-                    ticketData.payments.push({ ...ticketData.slipInfo, at: Date.now() });
-                    saveTickets();
-                    markSlipUsed(ticketData.slipInfo.transRef, { channelId: message.channel.id, userId: message.author.id });
-
-                    const verifiedEmbed = new EmbedBuilder()
-                        .setColor('#2ECC71')
-                        .addFields(
-                            { name: '👤 ผู้โอน',    value: ticketData.slipInfo.sender, inline: true },
-                            { name: '💰 ยอดโอน',    value: `${fmtAmount(ticketData.slipInfo.amount)} บาท`, inline: true },
-                            { name: '🔖 เลขอ้างอิง', value: `\`${ticketData.slipInfo.transRef}\``, inline: false }
-                        )
-                        .setFooter({ text: `ตรวจสอบสลิป${ticketData.slipInfo.source === 'TrueMoney Wallet' ? 'ทรูมันนี่' : 'ธนาคาร'}ผ่าน • รอแอดมินดำเนินการต่อ` });
-
-                    // ข้อความรับยอด (ตัวหัวข้อใหญ่) + รายละเอียดสลิปในเอมเบด
-                    await checkingMsg.edit({
-                        content: `# รับยอดค้าบ ${fmtAmount(ticketData.slipInfo.amount)} บาท`,
-                        embeds: [verifiedEmbed]
-                    });
-                    await message.channel.send(`🔔 <@&${ADMIN_ROLE_ID}> ลูกค้าโอนเงินแล้ว **ตรวจสอบสลิปผ่าน ✅** (คิวที่ ${ticketData.qNum})`);
-
-                    // แจ้งเตือนที่ห้องแจ้งสลิปกลาง
-                    const notifyChannel = client.channels.cache.get(SLIP_NOTIFY_CHANNEL_ID);
-                    if (notifyChannel) {
-                        await notifyChannel.send({
-                            embeds: [new EmbedBuilder()
-                                .setColor('#2ECC71')
-                                .setTitle('✅ มีการชำระเงิน — ตรวจสอบสลิปผ่านแล้ว')
-                                .addFields(
-                                    { name: '👤 ลูกค้า',    value: ticketData.userId ? `<@${ticketData.userId}>` : 'ไม่ทราบ', inline: true },
-                                    { name: '💰 ยอดโอน',    value: `${fmtAmount(ticketData.slipInfo.amount)} บาท`, inline: true },
-                                    { name: '🔖 เลขอ้างอิง', value: `\`${ticketData.slipInfo.transRef}\``, inline: false },
-                                    { name: '📍 ห้องออเดอร์', value: `<#${message.channel.id}>`, inline: false }
-                                )]
-                        }).catch(() => {});
-                    }
-                } else {
-                    // สลิปยังไม่ผ่าน — ไม่ mark ว่ารับยอดแล้ว ให้ลูกค้าส่งใหม่ได้
-                    await checkingMsg.edit({
-                        content: `❌ ${slipErrorMessage(result.reason, { slipAmount: result.data?.amount, expected })}`
-                    });
-
-                    // ไม่ผ่านการตรวจกับข้อมูลต้นทาง = อาจเป็นสลิปปลอม/ตัดต่อ (หรือรูปไม่ชัด) แจ้งแอดมินให้ดู ไม่รับยอดอัตโนมัติ
-                    if (['1007', '1008', '1011', 'NOT_VERIFIED', 'TW_NOT_VERIFIED'].includes(result.reason)) {
-                        await message.channel.send(`⚠️ <@&${ADMIN_ROLE_ID}> สลิปของ <@${message.author.id}> **ไม่ผ่านการตรวจสอบ** อาจเป็นสลิปปลอม/ตัดต่อ หรือรูปไม่ชัด กรุณาตรวจสอบก่อนดำเนินการ (คิวที่ ${ticketData.qNum})`).catch(() => {});
-                    }
-
-                    // กรณีระบบขัดข้อง/ไม่ได้ตั้งค่าคีย์ ให้แจ้งแอดมินมาตรวจเองแทน จะได้ไม่ตกหล่น
-                    if (['NO_API_KEY', 'NO_TW_KEY', 'TW_AUTH', 'NETWORK_ERROR', '1002', '1003', '1004', '1009', '1010'].includes(result.reason) && !ticketData.slipReceived) {
-                        ticketData.slipReceived = true;
-                        saveTickets();
-                        await message.channel.send(`🔔 <@&${ADMIN_ROLE_ID}> ลูกค้าส่งสลิปมาแต่ระบบตรวจอัตโนมัติใช้งานไม่ได้ กรุณาตรวจสอบด้วยตนเองครับ (คิวที่ ${ticketData.qNum})`);
-                    }
-                }
-            } catch (err) {
-                console.error('❌ ตรวจสลิปไม่สำเร็จ:', err);
-                await message.channel.send(`🔔 <@&${ADMIN_ROLE_ID}> ตรวจสลิปอัตโนมัติไม่สำเร็จ กรุณาตรวจสอบด้วยตนเองครับ (คิวที่ ${ticketData.qNum})`).catch(() => {});
-            } finally {
-                slipChecking.delete(message.channel.id);
-            }
-        }
-    }
 });
 
 // ════════════════════════════════════════════════════════════
 //  TICKET FLOW
 //
-//  create_ticket → สร้างห้องตั๋วทันที (ลูกค้า 1 คนมีตั๋วเปิดได้ทีละ 1 ห้อง จนกว่าห้องเก่าจะถูกลบ)
+//  create_ticket → สร้างห้องตั๋วทันที ไม่ถามอะไรเลย
 //  แอดมินใช้ !qr [ยอด] [ห้อง] เพื่อแจ้งยอด+สร้าง QR เมื่อไหร่ก็ได้ ห้องไหนก็ได้
-//  ADMIN เท่านั้น: btn_work (รับงาน)  |  btn_done (ปิดห้อง)
-//  ปิดห้องแล้วต้องครบ 1 วัน → ส่ง log เข้าห้อง LOG_CHANNEL_ID → ลบห้อง
-//  ลูกค้าไม่พิมพ์ในตั๋วครบ 24 ชม. → ปิดอัตโนมัติ (เข้าขั้นตอนเดียวกับปิดห้อง)
+//  ADMIN: btn_work (รับงาน)  |  btn_done (ปิดห้อง — แอดมินหรือเจ้าของตั๋วกดได้)
 // ════════════════════════════════════════════════════════════
 
 client.on('interactionCreate', async (interaction) => {
@@ -929,112 +300,80 @@ client.on('interactionCreate', async (interaction) => {
         if (interaction.isButton() && interaction.customId === 'create_ticket') {
             await interaction.deferReply({ ephemeral: true });
 
-            const userId = interaction.user.id;
-            if (creatingTicket.has(userId))
-                return interaction.editReply({ content: '⏳ กำลังสร้างตั๋วให้คุณอยู่ กรุณารอสักครู่ครับ' });
+            const channel = await interaction.guild.channels.create({
+                name:   `ticket-${queueCount}`,
+                parent: TICKET_CATEGORY_ID,
+                permissionOverwrites: [
+                    { id: interaction.guild.id, deny:  [PermissionFlagsBits.ViewChannel] },
+                    { id: interaction.user.id,  allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.AttachFiles] },
+                    { id: ADMIN_ROLE_ID,         allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] }
+                ]
+            });
 
-            creatingTicket.add(userId);
-            try {
-                // ลูกค้ายังมีตั๋วเก่าที่ไม่ถูกลบ → เปิดใหม่ไม่ได้
-                const oldId = Object.keys(activeTicketData).find(id =>
-                    activeTicketData[id].category === 'ticket' && activeTicketData[id].userId === userId
-                );
-                if (oldId) {
-                    const oldChan = await interaction.guild.channels.fetch(oldId)
-                        .catch(err => (err.code === 10003 ? null : undefined)); // null = ห้องถูกลบแล้ว, undefined = เช็คไม่ได้
-                    if (oldChan === undefined)
-                        return interaction.editReply({ content: '❌ ตรวจสอบตั๋วเก่าของคุณไม่ได้ในตอนนี้ กรุณาลองใหม่อีกครั้งครับ' });
-                    if (oldChan)
-                        return interaction.editReply({ content: `❌ คุณมีตั๋วที่ยังไม่ถูกลบอยู่ ${oldChan}\nต้องรอให้ตั๋วเดิมถูกลบก่อน จึงจะเปิดตั๋วใหม่ได้ครับ` });
+            activeTicketData[channel.id] = {
+                category:     'ticket',
+                label:        'Ticket',
+                price:        0,
+                userId:       interaction.user.id,
+                qNum:         queueCount,
+                payMethod:    'promptpay'
+            };
+            saveTickets();
 
-                    // ห้องเก่าไม่อยู่แล้ว เคลียร์ข้อมูลค้าง
-                    delete activeTicketData[oldId];
-                    saveTickets();
-                }
+            const embed = new EmbedBuilder()
+                .setTitle(`🎫 Ticket #${queueCount}`)
+                .setColor('#5865F2')
+                .setDescription(`สวัสดีครับ <@${interaction.user.id}>\n\nแจ้งรายละเอียดที่ต้องการได้เลยครับ รอแอดมินเข้ามาดำเนินการและแจ้งยอดชำระให้สักครู่นะครับ`);
 
-                const qNum = queueCount++;
-                saveQueue();
+            const btns = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId('btn_work').setLabel('รับงาน').setEmoji('🛠️').setStyle(ButtonStyle.Primary),
+                new ButtonBuilder().setCustomId('btn_done').setLabel('ปิดห้อง').setEmoji('✅').setStyle(ButtonStyle.Success)
+            );
 
-                const channel = await interaction.guild.channels.create({
-                    name:   `ticket-${qNum}`,
-                    parent: TICKET_CATEGORY_ID,
-                    permissionOverwrites: [
-                        { id: interaction.guild.id, deny:  [PermissionFlagsBits.ViewChannel] },
-                        { id: userId,               allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.AttachFiles] },
-                        { id: ADMIN_ROLE_ID,         allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages] }
-                    ]
-                });
+            await channel.send({ content: `🔔 <@&${ADMIN_ROLE_ID}>`, embeds: [embed], components: [btns] });
 
-                const now = Date.now();
-                activeTicketData[channel.id] = {
-                    category:       'ticket',
-                    label:          'Ticket',
-                    price:          0,
-                    userId,
-                    qNum,
-                    payMethod:      'promptpay',
-                    slipReceived:   false,
-                    slipVerified:   false,
-                    openedAt:       now,
-                    lastActivityAt: now
-                };
-                saveTickets();
+            queueCount++;
+            saveQueue();
 
-                const embed = new EmbedBuilder()
-                    .setTitle(`🎫 Ticket #${qNum}`)
-                    .setColor('#5865F2')
-                    .setDescription(`สวัสดีครับ <@${userId}>\n\nแจ้งรายละเอียดที่ต้องการได้เลยครับ รอแอดมินเข้ามาดำเนินการและแจ้งยอดชำระให้สักครู่นะครับ`);
-
-                // ปุ่มสีดำ (ใน Discord ใกล้เคียงสุดคือ Secondary สีเทาเข้ม) — กดได้เฉพาะแอดมิน
-                const btns = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder().setCustomId('btn_work').setLabel('รับงาน').setEmoji(buttonEmoji(WORK_EMOJI_ID, '✅')).setStyle(ButtonStyle.Secondary),
-                    new ButtonBuilder().setCustomId('btn_done').setLabel('ปิดห้อง').setEmoji(buttonEmoji(DONE_EMOJI_ID, '❌')).setStyle(ButtonStyle.Secondary)
-                );
-
-                const panel = await channel.send({ content: `🔔 <@&${ADMIN_ROLE_ID}>`, embeds: [embed], components: [btns] });
-                activeTicketData[channel.id].panelMessageId = panel.id;
-                saveTickets();
-
-                return interaction.editReply({ content: `✅ สร้างตั๋วเรียบร้อยแล้ว! แตะที่นี่ได้เลย 👉 ${channel}` });
-            } finally {
-                creatingTicket.delete(userId);
-            }
+            return interaction.editReply({ content: `✅ สร้างตั๋วเรียบร้อยแล้ว! แตะที่นี่ได้เลย 👉 ${channel}` });
         }
 
         // ════════════════════════════════════════════════════════════
-        //  ADMIN TICKET BUTTONS (กดได้เฉพาะแอดมิน)
+        //  ADMIN TICKET BUTTONS
         // ════════════════════════════════════════════════════════════
 
-        if (interaction.isButton() && (interaction.customId === 'btn_work' || interaction.customId === 'btn_done')) {
-            if (!interaction.member.roles.cache.has(ADMIN_ROLE_ID))
-                return interaction.reply({ content: '❌ ปุ่มนี้ใช้ได้เฉพาะแอดมินเท่านั้นครับ', ephemeral: true });
-
+        if (interaction.isButton() && interaction.customId === 'btn_work') {
+            if (!interaction.member.roles.cache.has(ADMIN_ROLE_ID)) return;
             const data = activeTicketData[interaction.channel.id];
-            if (!data)
-                return interaction.reply({ content: '❌ ไม่พบข้อมูลตั๋วนี้ในระบบ (อาจถูกปิดไปแล้ว)', ephemeral: true });
+            if (!data) return;
 
-            // ── รับงาน ──
-            if (interaction.customId === 'btn_work') {
-                if (data.acceptedBy)
-                    return interaction.reply({ content: `ℹ️ ตั๋วนี้ถูกรับงานโดย <@${data.acceptedBy}> แล้วครับ`, ephemeral: true });
+            await interaction.reply({ content: `👨‍💻 <@${interaction.user.id}> รับงานนี้แล้วครับ กำลังดำเนินการให้${data.userId ? ` <@${data.userId}>` : ''}` });
+            return interaction.channel.setName(`🛠️-${data.qNum}`).catch(() => {});
+        }
 
-                data.acceptedBy     = interaction.user.id;
-                data.acceptedAt     = Date.now();
-                saveTickets();
+        if (interaction.isButton() && interaction.customId === 'btn_done') {
+            const data = activeTicketData[interaction.channel.id];
+            if (!data) return;
 
-                await interaction.reply({ content: `👨‍💻 <@${interaction.user.id}> รับงานนี้แล้วครับ กำลังดำเนินการให้${data.userId ? ` <@${data.userId}>` : ''}` });
-                return interaction.channel.setName(`🛠️-${data.qNum}`).catch(() => {});
-            }
+            const isAdmin = interaction.member.roles.cache.has(ADMIN_ROLE_ID);
+            if (!isAdmin && interaction.user.id !== data.userId)
+                return interaction.reply({ content: '❌ คุณไม่มีสิทธิ์ปิดห้องนี้ครับ', ephemeral: true });
 
-            // ── ปิดห้อง ──
             if (data.closeAt)
-                return interaction.reply({ content: '⏳ ห้องนี้ถูกปิดไปแล้ว กำลังรอลบห้องครับ', ephemeral: true });
+                return interaction.reply({ content: '⏳ ห้องนี้ถูกปิดไปแล้ว กำลังรอย้ายเข้าหมวดเก็บงานครับ', ephemeral: true });
 
-            beginClose(interaction.channel.id, { closedBy: interaction.user.id });
+            // บันทึกเวลาปิดลงไฟล์ก่อน เผื่อบอทรีสตาร์ทระหว่างรอ แล้วตั้งเวลาย้าย+ซ่อน
+            data.closeAt = Date.now() + CLOSE_DELAY_MS;
+            saveTickets();
+            scheduleClose(interaction.channel.id, CLOSE_DELAY_MS);
+
+            const embed = new EmbedBuilder()
+                .setColor('#2ECC71').setTitle('✅ ปิดห้องแล้ว')
+                .setDescription(`ห้องนี้ถูกปิดแล้วครับ ระบบจะย้ายและซ่อนห้องภายใน ${CLOSE_DELAY_MS / 60000} นาที\n\n💖 ขอบคุณที่ใช้บริการครับ ฝากรีวิวได้ที่ <#${REVIEW_CHANNEL_ID}>`);
 
             await interaction.message.edit({ components: [] }).catch(() => {});
-            await interaction.reply({ embeds: [buildCloseEmbed(false)] });
-            // ไม่ await: ถ้าติด rate limit ของการเปลี่ยนชื่อห้อง จะได้ไม่ขวางการลบห้อง
+            await interaction.reply({ embeds: [embed] });
+            // ไม่ await: ถ้าติด rate limit ของการเปลี่ยนชื่อห้อง จะได้ไม่ขวางการย้ายห้อง
             interaction.channel.setName(`✅-${data.qNum}`).catch(() => {});
             return;
         }
