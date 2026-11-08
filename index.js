@@ -26,6 +26,7 @@ const DONE_CATEGORY_ID       = '1554881839745994884'; // Category ที่ย�
 const REVIEW_CHANNEL_ID      = '1554881839745994883'; // ห้องรีวิว (เอาไว้นับจำนวน)
 
 const PROMPTPAY_NUMBER = '0621473585'; // เบอร์พร้อมเพย์รับเงิน
+const REVIEW_REACTIONS = ['237291pinkhearts', 'blackverified']; // อีโมจิที่บอทกดใต้ "ทุกข้อความ" ในห้องรีวิว (กดเรียงตามลำดับ) — ใส่เป็นชื่ออีโมจิเซิร์ฟเวอร์ (ไม่ต้องใส่ :) หรืออีโมจิธรรมดา เช่น '❤️'
 
 const QUEUE_FILE        = './queue.txt';
 const TICKET_FILE       = './active_tickets.json';
@@ -150,6 +151,36 @@ function scheduleReviewRename() {
     }, wait);
 }
 
+/** แปลงค่าใน REVIEW_REACTIONS เป็นอีโมจิที่ message.react() ใช้ได้ (ชื่ออีโมจิเซิร์ฟเวอร์ → หาจากชื่อ) */
+async function resolveReactionEmoji(guild, input) {
+    const raw = String(input).trim();
+    if (!/^[A-Za-z0-9_]+$/.test(raw) || /^\d+$/.test(raw)) return raw; // อีโมจิยูนิโค้ด / <:ชื่อ:ไอดี> / ไอดีล้วน ใช้ตรงๆ
+
+    const find = (emojis) => emojis.find(e => e.name === raw) || emojis.find(e => e.name?.toLowerCase() === raw.toLowerCase());
+    let emoji = find(guild.emojis.cache) || find(client.emojis.cache);
+    if (!emoji) {
+        await guild.emojis.fetch().catch(() => {});
+        emoji = find(guild.emojis.cache);
+    }
+    return emoji || null;
+}
+
+/** กดรีแอคชั่นทุกอันใน REVIEW_REACTIONS ใต้ข้อความในห้องรีวิว — ไม่โยน error ออกไป จะได้ไม่กระทบระบบนับรีวิว */
+async function reactToReviewMessage(message) {
+    for (const name of REVIEW_REACTIONS) {
+        try {
+            const emoji = await resolveReactionEmoji(message.guild, name);
+            if (!emoji) {
+                console.error(`❌ ไม่พบอีโมจิชื่อ "${name}" — เช็คว่าอีโมจิอยู่ในเซิร์ฟเวอร์ที่บอทอยู่ และสะกดชื่อถูก`);
+                continue;
+            }
+            await message.react(emoji);
+        } catch (err) {
+            console.error(`❌ กดรีแอคชั่น "${name}" ในห้องรีวิวไม่ได้ (เช็คสิทธิ์ Add Reactions + Read Message History + Use External Emojis ของบอทในห้องนี้):`, err.message);
+        }
+    }
+}
+
 // ==========================================
 // [ 6. Client ]
 // ==========================================
@@ -183,7 +214,14 @@ client.once(Events.ClientReady, async () => {
 // [ 7. Message Handler: คำสั่งแอดมิน + นับรีวิว ]
 // ==========================================
 client.on('messageCreate', async (message) => {
-    if (!message.guild || message.author.bot) return;
+    if (!message.guild) return;
+
+    // ── ห้องรีวิว: กดรีแอคชั่นให้ทุกข้อความ (ใครพิมพ์อะไรมาก็กด รวมแอดมินและบอทอื่น ยกเว้นข้อความของบอทเอง) ──
+    if (message.channel.id === REVIEW_CHANNEL_ID && message.author.id !== client.user.id) {
+        reactToReviewMessage(message); // ไม่ await — ไม่ให้การกดอีโมจิหน่วงระบบนับรีวิว
+    }
+
+    if (message.author.bot) return;
 
     // ── ระบบนับรีวิว (เช็คก่อนคำสั่ง เพื่อให้รีวิวที่ขึ้นต้นด้วย ! ก็นับ) ──
     if (message.channel.id === REVIEW_CHANNEL_ID) {
