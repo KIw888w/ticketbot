@@ -11,7 +11,8 @@ process.on('uncaughtException',  (err)    => { console.error('💥 Uncaught Exce
 // ==========================================
 const {
     Client, GatewayIntentBits, ActionRowBuilder, EmbedBuilder,
-    PermissionFlagsBits, ButtonBuilder, ButtonStyle, Events
+    PermissionFlagsBits, ButtonBuilder, ButtonStyle, Events,
+    ModalBuilder, TextInputBuilder, TextInputStyle
 } = require('discord.js');
 
 const fs = require('fs');
@@ -26,11 +27,16 @@ const DONE_CATEGORY_ID       = '1554881839745994884'; // Category ที่ย�
 const REVIEW_CHANNEL_ID      = '1554881839745994883'; // ห้องรีวิว (เอาไว้นับจำนวน)
 
 const PROMPTPAY_NUMBER = '0621473585'; // เบอร์พร้อมเพย์รับเงิน
-const REVIEW_REACTIONS = ['237291pinkhearts', 'blackverified']; // อีโมจิที่บอทกดใต้ "ทุกข้อความ" ในห้องรีวิว (กดเรียงตามลำดับ) — ใส่เป็นชื่ออีโมจิเซิร์ฟเวอร์ (ไม่ต้องใส่ :) หรืออีโมจิธรรมดา เช่น '❤️'
+const REVIEW_REACTIONS = ['❤️']; // อีโมจิที่บอทกดใต้รีวิวลูกค้า (เพิ่มได้หลายอัน เช่น ['❤️', '⭐']) — อีโมจิเซิร์ฟเวอร์ใช้รูปแบบ '<:ชื่อ:ไอดี>' หรือใส่แค่ไอดี
 
 const QUEUE_FILE        = './queue.txt';
 const TICKET_FILE       = './active_tickets.json';
 const REVIEW_COUNT_FILE = './review_count.json';
+
+const LOG_CHANNEL_ID = '1568982552969224315';   // ห้อง log สรุปตอนลบห้องตั๋ว (ว่าง = ไม่ส่ง log)
+// ห้องโชว์สินค้าที่จัดส่งแล้ว (ส่งสรุปออเดอร์ให้คนอื่นเห็นตอนกดปิดห้อง)
+const PRODUCT_CHANNELS = { nitro: '1566033586744987698', frame: '1566033685491486720' };
+const PRODUCT_LABEL    = { nitro: 'Nitro', frame: 'กรอบรูป' };
 
 // ==========================================
 // [ 4. Runtime State ]
@@ -93,8 +99,8 @@ function buildReviewChannelName(currentName, count) {
     return `${currentName}〔${count}〕`;
 }
 
-// ── ปิดตั๋ว: รอ 10 นาที แล้วย้ายเข้าหมวดเก็บงาน + ซ่อนห้องจากลูกค้า ──
-const CLOSE_DELAY_MS = 10 * 60 * 1000;
+// ── ปิดตั๋ว: รอ 1 วันแล้วลบห้อง + ส่ง log ──
+const CLOSE_DELAY_MS = 24 * 60 * 60 * 1000;
 const closeTimers    = new Map(); // channelId -> timeout
 
 function scheduleClose(channelId, delayMs) {
@@ -106,20 +112,52 @@ function scheduleClose(channelId, delayMs) {
     closeTimers.set(channelId, timer);
 }
 
+/** สถานะตาม ticket: จัดส่งสำเร็จ (กดปิดแล้ว) / กำลังดำเนินการ (รับงานแล้ว) / รอดำเนินการ */
+function orderStatusText(data) {
+    if (data.closeAt) return '✅ จัดส่งสำเร็จ';
+    if (data.accepted) return '🛠️ กำลังดำเนินการ';
+    return '⏳ รอดำเนินการ';
+}
+
+/** embed สรุปออเดอร์ (แบบเดียวกับหน้า Order Status) */
+async function buildOrderEmbed(data) {
+    const buyer = await client.users.fetch(data.userId).then(u => u.username).catch(() => data.userId || '-');
+    const price = data.price ? `${Number(data.price).toLocaleString('en-US')} บาท` : 'ไม่ได้ระบุ';
+    return new EmbedBuilder()
+        .setColor(data.productType === 'frame' ? '#FF6FAF' : '#5865F2')
+        .setTitle('📋 Order Status')
+        .setDescription(
+            `🛒 **รายการสั่งซื้อ**\n\n` +
+            `👤 ผู้ซื้อ : \`${buyer}\`\n` +
+            `🎁 ประเภทสินค้า : \`${PRODUCT_LABEL[data.productType] ?? '-'}\`\n` +
+            `📦 ชื่อสินค้า : \`${data.productName || '-'}\`\n` +
+            `💳 ราคาที่ชำระ : \`${price}\`\n` +
+            `📋 สถานะสั่งซื้อ : ${orderStatusText(data)}`
+        )
+        .setFooter({ text: `Order No. / Ord #${data.orderNo || '-'}` })
+        .setTimestamp();
+}
+
+/** ครบ 1 วัน: ลบห้องตั๋ว แล้วส่ง log ไปห้อง LOG_CHANNEL_ID */
 async function closeTicket(channelId) {
-    const data   = activeTicketData[channelId];
-    const userId = data?.userId;
+    const data = activeTicketData[channelId];
+    if (!data) return;
 
     try {
-        const chan = await client.channels.fetch(channelId);
-        await chan.setParent(DONE_CATEGORY_ID, { lockPermissions: false });
-        if (userId) await chan.permissionOverwrites.edit(userId, { ViewChannel: false });
-        console.log(`📦 ตั๋ว #${data?.qNum ?? '?'} ย้ายเข้าหมวดเก็บงานและซ่อนจากลูกค้าแล้ว`);
+        const chan = await client.channels.fetch(channelId).catch(() => null);
+        if (chan) await chan.delete(`ลบตั๋ว #${data.qNum} ครบ 1 วัน`);
+        console.log(`🗑️ ลบตั๋ว #${data.qNum} แล้ว`);
     } catch (err) {
-        if (err.code !== 10003) { // 10003 = Unknown Channel (ห้องถูกลบไปแล้ว ก็ถือว่าเสร็จ)
-            console.error(`❌ ย้าย/ซ่อนตั๋ว ${channelId} ไม่สำเร็จ (เช็ค DONE_CATEGORY_ID, สิทธิ์ Manage Channels, หมวดเต็ม 50 ห้อง):`, err.message);
-            return; // เก็บข้อมูลไว้ จะลองใหม่ตอนบอทเริ่มรันครั้งถัดไป
+        if (err.code !== 10003) { // 10003 = ห้องถูกลบไปแล้ว ถือว่าเสร็จ
+            console.error(`❌ ลบตั๋ว ${channelId} ไม่สำเร็จ (เช็คสิทธิ์ Manage Channels):`, err.message);
+            return; // เก็บข้อมูลไว้ ลองใหม่ตอนบอทรีสตาร์ท
         }
+    }
+
+    if (LOG_CHANNEL_ID) {
+        const logCh = await client.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
+        if (logCh) await logCh.send({ embeds: [await buildOrderEmbed(data)], allowedMentions: { parse: [] } })
+            .catch(err => console.error('❌ ส่ง log ไม่สำเร็จ:', err.message));
     }
 
     delete activeTicketData[channelId];
@@ -149,36 +187,6 @@ function scheduleReviewRename() {
             console.error('❌ เปลี่ยนชื่อห้องรีวิวไม่ได้ (เช็ค REVIEW_CHANNEL_ID และสิทธิ์ Manage Channels ของบอท):', err.message);
         }
     }, wait);
-}
-
-/** แปลงค่าใน REVIEW_REACTIONS เป็นอีโมจิที่ message.react() ใช้ได้ (ชื่ออีโมจิเซิร์ฟเวอร์ → หาจากชื่อ) */
-async function resolveReactionEmoji(guild, input) {
-    const raw = String(input).trim();
-    if (!/^[A-Za-z0-9_]+$/.test(raw) || /^\d+$/.test(raw)) return raw; // อีโมจิยูนิโค้ด / <:ชื่อ:ไอดี> / ไอดีล้วน ใช้ตรงๆ
-
-    const find = (emojis) => emojis.find(e => e.name === raw) || emojis.find(e => e.name?.toLowerCase() === raw.toLowerCase());
-    let emoji = find(guild.emojis.cache) || find(client.emojis.cache);
-    if (!emoji) {
-        await guild.emojis.fetch().catch(() => {});
-        emoji = find(guild.emojis.cache);
-    }
-    return emoji || null;
-}
-
-/** กดรีแอคชั่นทุกอันใน REVIEW_REACTIONS ใต้ข้อความในห้องรีวิว — ไม่โยน error ออกไป จะได้ไม่กระทบระบบนับรีวิว */
-async function reactToReviewMessage(message) {
-    for (const name of REVIEW_REACTIONS) {
-        try {
-            const emoji = await resolveReactionEmoji(message.guild, name);
-            if (!emoji) {
-                console.error(`❌ ไม่พบอีโมจิชื่อ "${name}" — เช็คว่าอีโมจิอยู่ในเซิร์ฟเวอร์ที่บอทอยู่ และสะกดชื่อถูก`);
-                continue;
-            }
-            await message.react(emoji);
-        } catch (err) {
-            console.error(`❌ กดรีแอคชั่น "${name}" ในห้องรีวิวไม่ได้ (เช็คสิทธิ์ Add Reactions + Read Message History + Use External Emojis ของบอทในห้องนี้):`, err.message);
-        }
-    }
 }
 
 // ==========================================
@@ -214,14 +222,7 @@ client.once(Events.ClientReady, async () => {
 // [ 7. Message Handler: คำสั่งแอดมิน + นับรีวิว ]
 // ==========================================
 client.on('messageCreate', async (message) => {
-    if (!message.guild) return;
-
-    // ── ห้องรีวิว: กดรีแอคชั่นให้ทุกข้อความ (ใครพิมพ์อะไรมาก็กด รวมแอดมินและบอทอื่น ยกเว้นข้อความของบอทเอง) ──
-    if (message.channel.id === REVIEW_CHANNEL_ID && message.author.id !== client.user.id) {
-        reactToReviewMessage(message); // ไม่ await — ไม่ให้การกดอีโมจิหน่วงระบบนับรีวิว
-    }
-
-    if (message.author.bot) return;
+    if (!message.guild || message.author.bot) return;
 
     // ── ระบบนับรีวิว (เช็คก่อนคำสั่ง เพื่อให้รีวิวที่ขึ้นต้นด้วย ! ก็นับ) ──
     if (message.channel.id === REVIEW_CHANNEL_ID) {
@@ -232,6 +233,16 @@ client.on('messageCreate', async (message) => {
             saveReviewCount();
             console.log(`⭐ นับรีวิวใหม่ → ${reviewCount}`);
             scheduleReviewRename();
+
+            // กดรีแอคชั่นอัตโนมัติใต้รีวิว (ทีละอัน เรียงตามลำดับ) — พังก็ไม่กระทบการนับ
+            for (const emoji of REVIEW_REACTIONS) {
+                try {
+                    await message.react(emoji);
+                } catch (err) {
+                    console.error(`❌ กดรีแอคชั่น ${emoji} ในห้องรีวิวไม่ได้ (เช็คสิทธิ์ Add Reactions + Read Message History ของบอทในห้องนี้, และอีโมจิถูกต้องไหม):`, err.message);
+                    break;
+                }
+            }
             return;
         }
     }
@@ -386,9 +397,12 @@ client.on('interactionCreate', async (interaction) => {
             if (!data) return;
 
             await interaction.reply({ content: `👨‍💻 <@${interaction.user.id}> รับงานนี้แล้วครับ กำลังดำเนินการให้${data.userId ? ` <@${data.userId}>` : ''}` });
+            data.accepted = true;
+            saveTickets();
             return interaction.channel.setName(`🛠️-${data.qNum}`).catch(() => {});
         }
 
+        // ── กดปิดห้อง → เลือกประเภทสินค้า (Nitro / กรอบรูป) ──
         if (interaction.isButton() && interaction.customId === 'btn_done') {
             const data = activeTicketData[interaction.channel.id];
             if (!data) return;
@@ -398,20 +412,64 @@ client.on('interactionCreate', async (interaction) => {
                 return interaction.reply({ content: '❌ คุณไม่มีสิทธิ์ปิดห้องนี้ครับ', ephemeral: true });
 
             if (data.closeAt)
-                return interaction.reply({ content: '⏳ ห้องนี้ถูกปิดไปแล้ว กำลังรอย้ายเข้าหมวดเก็บงานครับ', ephemeral: true });
+                return interaction.reply({ content: '⏳ ห้องนี้ถูกปิดไปแล้ว รอการลบอัตโนมัติ 1 วันครับ', ephemeral: true });
 
-            // บันทึกเวลาปิดลงไฟล์ก่อน เผื่อบอทรีสตาร์ทระหว่างรอ แล้วตั้งเวลาย้าย+ซ่อน
-            data.closeAt = Date.now() + CLOSE_DELAY_MS;
+            return interaction.reply({
+                content: '📦 **เลือกประเภทสินค้าของออเดอร์นี้**\nราคาจะดึงจาก QR ที่สร้างไว้ให้อัตโนมัติ',
+                components: [new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId('close_type_nitro').setLabel('Nitro').setEmoji('🎁').setStyle(ButtonStyle.Primary),
+                    new ButtonBuilder().setCustomId('close_type_frame').setLabel('กรอบรูป').setEmoji('🖼️').setStyle(ButtonStyle.Secondary)
+                )],
+                ephemeral: true
+            });
+        }
+
+        // ── เลือกประเภทแล้ว → กรอกชื่อสินค้า ──
+        if (interaction.isButton() && (interaction.customId === 'close_type_nitro' || interaction.customId === 'close_type_frame')) {
+            const data = activeTicketData[interaction.channel.id];
+            if (!data || data.closeAt) return interaction.reply({ content: '⏳ ห้องนี้ถูกปิดไปแล้วหรือไม่พบข้อมูลตั๋ว', ephemeral: true });
+
+            const type  = interaction.customId === 'close_type_nitro' ? 'nitro' : 'frame';
+            const modal = new ModalBuilder()
+                .setCustomId(`close_info_${type}`)
+                .setTitle('📦 ข้อมูลสินค้า')
+                .addComponents(new ActionRowBuilder().addComponents(
+                    new TextInputBuilder()
+                        .setCustomId('product_name')
+                        .setLabel('ชื่อสินค้า')
+                        .setStyle(TextInputStyle.Short)
+                        .setPlaceholder('เช่น กากสุด')
+                        .setMaxLength(100)
+                        .setRequired(true)
+                ));
+            return interaction.showModal(modal);
+        }
+
+        // ── กรอกชื่อสินค้าแล้ว → ปิดห้อง ตั้งเวลาลบ 1 วัน + โพสต์สรุปไปห้องโชว์สินค้า ──
+        if (interaction.isModalSubmit() && interaction.customId.startsWith('close_info_')) {
+            const type = interaction.customId.slice('close_info_'.length);
+            const data = activeTicketData[interaction.channel.id];
+            if (!data) return interaction.reply({ content: '❌ ไม่พบข้อมูลตั๋วนี้', ephemeral: true });
+            if (data.closeAt) return interaction.reply({ content: '⏳ ห้องนี้ถูกปิดไปแล้วครับ', ephemeral: true });
+
+            data.productType = type;
+            data.productName = interaction.fields.getTextInputValue('product_name').trim();
+            data.orderNo     = `DECO-${type.toUpperCase()}-${Math.random().toString(16).slice(2, 10).toUpperCase()}`;
+            data.status      = 'done';
+            data.closeAt     = Date.now() + CLOSE_DELAY_MS;
             saveTickets();
             scheduleClose(interaction.channel.id, CLOSE_DELAY_MS);
 
+            const showCh = await client.channels.fetch(PRODUCT_CHANNELS[type]).catch(() => null);
+            if (showCh) await showCh.send({ embeds: [await buildOrderEmbed(data)], allowedMentions: { parse: [] } })
+                .catch(err => console.error('❌ โพสต์สรุปไปห้องโชว์ไม่สำเร็จ:', err.message));
+            else console.error(`❌ ไม่พบห้องโชว์สินค้า ${PRODUCT_CHANNELS[type]}`);
+
             const embed = new EmbedBuilder()
                 .setColor('#2ECC71').setTitle('✅ ปิดห้องแล้ว')
-                .setDescription(`ห้องนี้ถูกปิดแล้วครับ ระบบจะย้ายและซ่อนห้องภายใน ${CLOSE_DELAY_MS / 60000} นาที\n\n💖 ขอบคุณที่ใช้บริการครับ ฝากรีวิวได้ที่ <#${REVIEW_CHANNEL_ID}>`);
+                .setDescription(`ห้องนี้ถูกปิดแล้วครับ ระบบจะลบห้องภายใน 1 วัน\n\n💖 ขอบคุณที่ใช้บริการครับ ฝากรีวิวได้ที่ <#${REVIEW_CHANNEL_ID}>`);
 
-            await interaction.message.edit({ components: [] }).catch(() => {});
             await interaction.reply({ embeds: [embed] });
-            // ไม่ await: ถ้าติด rate limit ของการเปลี่ยนชื่อห้อง จะได้ไม่ขวางการย้ายห้อง
             interaction.channel.setName(`✅-${data.qNum}`).catch(() => {});
             return;
         }
