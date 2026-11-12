@@ -232,9 +232,9 @@ async function finishTicket(channel, data, { post = true } = {}) {
 const spinRewardText = () => SPIN_TABLE
     .map(o => o.pts ? `แต้มฟรี ${o.pts} แต้ม` : o.key === 'reroll' ? 'สุ่มฟรี 1 ครั้ง' : PRODUCT_LABEL[o.key])
     .filter((v, i, a) => a.indexOf(v) === i)
-    .join(' · ');
+    .map(v => `• ${v}`)
+    .join('\n');
 const shopRewardText = () => SHOP_ITEMS.map(it => `• ${it.label} — ${it.price} แต้ม`).join('\n');
-const rewardsOverview = () => `🎲 **สุ่มรางวัล** (${REWARD_THRESHOLD} แต้ม/ครั้ง)\n${spinRewardText()}\n\n💰 **แลกของรางวัล**\n${shopRewardText()}`;
 const newRewardId = () => 'R' + Date.now().toString(36).slice(-4).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
 const progressBar = (p, n = 10) => { const f = Math.min(n, Math.floor(p / REWARD_THRESHOLD * n)); return '▰'.repeat(f) + '▱'.repeat(n - f); };
 const itemChannel = (key) => (key === 'nitro' || key === 'shop1') ? PRODUCT_CHANNELS.nitro : PRODUCT_CHANNELS.frame;
@@ -496,9 +496,9 @@ client.on('messageCreate', async (message) => {
         // !randompanel → วางปุ่มหน้าสุ่มรางวัลในห้องนี้
         if (command === '!randompanel') {
             const embed = new EmbedBuilder().setColor('#F1C40F').setTitle('🎲 ระบบสุ่มรางวัล')
-                .setDescription(`ใช้แต้มสะสมสุ่มรางวัลได้เลย\n\n${rewardsOverview()}\n\nกดปุ่มด้านล่างเพื่อดูแต้มและสุ่มรางวัล`);
+                .setDescription(`ใช้แต้มสะสมสุ่มรางวัลได้เลย (${REWARD_THRESHOLD} แต้ม/ครั้ง)\n\n🎲 **ของรางวัลที่สุ่มได้**\n${spinRewardText()}\n\nกดปุ่มด้านล่างเพื่อดูแต้มและสุ่มรางวัล`);
             await message.channel.send({ ...bannerPayload(embed), components: [new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId('random_page').setLabel('หน้าสุ่มรางวัล').setEmoji('🎲').setStyle(ButtonStyle.Secondary)
+                new ButtonBuilder().setCustomId('random_page').setLabel('สุ่มรางวัล').setEmoji('🎲').setStyle(ButtonStyle.Secondary)
             )] });
             return;
         }
@@ -506,7 +506,7 @@ client.on('messageCreate', async (message) => {
         // !shoppanel → วางปุ่มร้านแลกของรางวัลในห้องนี้
         if (command === '!shoppanel') {
             const embed = new EmbedBuilder().setColor('#5865F2').setTitle('💰 ร้านแลกของรางวัล')
-                .setDescription(`แลกแต้มสะสมเป็นของรางวัลได้เลย\n\n${rewardsOverview()}\n\nกดปุ่มด้านล่างเพื่อดูสินค้าและสต็อกคงเหลือ`);
+                .setDescription(`แลกแต้มสะสมเป็นของรางวัลได้เลย\n\n💰 **ของรางวัลที่แลกได้**\n${shopRewardText()}\n\nกดปุ่มด้านล่างเพื่อดูสินค้าและสต็อกคงเหลือ`);
             await message.channel.send({ ...bannerPayload(embed), components: [new ActionRowBuilder().addComponents(
                 new ButtonBuilder().setCustomId('shop').setLabel('แลกของรางวัล').setEmoji('💰').setStyle(ButtonStyle.Primary)
             )] });
