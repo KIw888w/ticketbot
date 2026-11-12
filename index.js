@@ -12,8 +12,19 @@ process.on('uncaughtException',  (err)    => { console.error('💥 Uncaught Exce
 const {
     Client, GatewayIntentBits, ActionRowBuilder, EmbedBuilder,
     PermissionFlagsBits, ButtonBuilder, ButtonStyle, Events,
-    ModalBuilder, TextInputBuilder, TextInputStyle, StringSelectMenuBuilder
+    ModalBuilder, TextInputBuilder, TextInputStyle, StringSelectMenuBuilder, AttachmentBuilder
 } = require('discord.js');
+
+const BANNER_URL  = '';                      // ใส่ลิงก์รูปแบนเนอร์ตรงนี้ (เช่น https://...png)
+const BANNER_FILE = './banner_points.png';   // หรือวางไฟล์นี้ไว้ข้าง index.js ถ้าไม่ใส่ลิงก์
+
+/** แนบแบนเนอร์: ใช้ลิงก์ก่อน ถ้าไม่มีค่อยใช้ไฟล์ ถ้าไม่มีทั้งคู่ก็ไม่แสดงรูป */
+function bannerPayload(embed) {
+    if (BANNER_URL) return { embeds: [embed.setImage(BANNER_URL)], files: [] };
+    if (require('fs').existsSync(BANNER_FILE))
+        return { embeds: [embed.setImage('attachment://banner_points.png')], files: [new AttachmentBuilder(BANNER_FILE, { name: 'banner_points.png' })] };
+    return { embeds: [embed], files: [] };
+}
 
 const fs = require('fs');
 
@@ -400,7 +411,7 @@ client.on('messageCreate', async (message) => {
         const args    = message.content.trim().split(/ +/);
         const command = args[0].toLowerCase();
 
-        const ADMIN_COMMANDS = ['!setupshop', '!qr', '!points', '!addpoints', '!rewards', '!pointlog', '!undo', '!topbuyer', '!setstock', '!stock'];
+        const ADMIN_COMMANDS = ['!setupshop', '!qr', '!points', '!addpoints', '!rewards', '!pointlog', '!undo', '!topbuyer', '!setstock', '!stock', '!randompanel', '!shoppanel'];
         if (!ADMIN_COMMANDS.includes(command)) return;
 
         // แจ้งเตือนชัดเจนแทนการเงียบ เผื่อ role ไม่ตรง จะได้รู้ทันทีว่าปัญหาคืออะไร
@@ -424,9 +435,7 @@ client.on('messageCreate', async (message) => {
                 .setFooter({ text: 'ระบบร้านค้าอัตโนมัติ' });
 
             const buttons = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId('create_ticket').setLabel('ᴄʀᴇᴀᴛᴇ ᴛɪᴄᴋᴇᴛ').setEmoji(BTN_EMOJI.contact).setStyle(ButtonStyle.Success),
-                new ButtonBuilder().setCustomId('random_page').setLabel('หน้าสุ่มรางวัล').setEmoji('🎲').setStyle(ButtonStyle.Secondary),
-                new ButtonBuilder().setCustomId('shop').setLabel('แลกของรางวัล').setEmoji('💰').setStyle(ButtonStyle.Primary)
+                new ButtonBuilder().setCustomId('create_ticket').setLabel('ᴄʀᴇᴀᴛᴇ ᴛɪᴄᴋᴇᴛ').setEmoji(BTN_EMOJI.contact).setStyle(ButtonStyle.Success)
             );
 
             return message.channel.send({ embeds: [embed], components: [buttons] });
@@ -476,6 +485,26 @@ client.on('messageCreate', async (message) => {
 
             await targetChannel.send({ embeds: [qrEmbed] });
             return message.reply(`✅ สร้าง QR ยอด **${amount.toLocaleString()} บาท** ส่งไปที่ ${targetChannel} แล้วครับ`);
+        }
+
+        // !randompanel → วางปุ่มหน้าสุ่มรางวัลในห้องนี้
+        if (command === '!randompanel') {
+            const embed = new EmbedBuilder().setColor('#F1C40F').setTitle('🎲 ระบบสุ่มรางวัล')
+                .setDescription('ใช้แต้มสะสมสุ่มรางวัลได้เลย\nกดปุ่มด้านล่างเพื่อดูแต้มของคุณและสุ่มรางวัล');
+            await message.channel.send({ ...bannerPayload(embed), components: [new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId('random_page').setLabel('สุ่มรางวัล').setEmoji('🎲').setStyle(ButtonStyle.Secondary)
+            )] });
+            return;
+        }
+
+        // !shoppanel → วางปุ่มร้านแลกของรางวัลในห้องนี้
+        if (command === '!shoppanel') {
+            const embed = new EmbedBuilder().setColor('#5865F2').setTitle('💰 ร้านแลกของรางวัล')
+                .setDescription('แลกแต้มสะสมเป็นของรางวัลได้เลย\nกดปุ่มด้านล่างเพื่อดูสินค้าและสต็อกคงเหลือ');
+            await message.channel.send({ ...bannerPayload(embed), components: [new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId('shop').setLabel('แลกของรางวัล').setEmoji('💰').setStyle(ButtonStyle.Primary)
+            )] });
+            return;
         }
 
         // !stock → ดูสต็อกร้านแลกของรางวัล
