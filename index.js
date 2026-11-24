@@ -297,16 +297,16 @@ async function askVision(parts) {
     if (process.env.GEMINI_API_KEY) providers.push(['Gemini', askGemini]);
     if (!providers.length) throw new Error('ยังไม่ได้ตั้งค่า GROQ_API_KEY หรือ GEMINI_API_KEY');
 
-    let lastErr = null;
+    const errors = [];
     for (const [name, fn] of providers) {
         try {
             return await fn(parts);
         } catch (err) {
             console.error(`⚠️ ${name} อ่านรูปไม่สำเร็จ:`, err.message);
-            lastErr = err;
+            errors.push(`${name}: ${err.message}`);
         }
     }
-    throw lastErr;
+    throw new Error(errors.join(' | ').slice(0, 400));
 }
 
 /** แปลงไฟล์แนบของดิสคอร์ดเป็นชิ้นข้อมูลรูปสำหรับ Gemini */
