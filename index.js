@@ -219,29 +219,46 @@ function rollSpin() {
 const ocrResult = new Map();
 
 const OCR_MIME = ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'];   // รูปแบบที่ Gemini รับ
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-flash-latest';   // ตั้ง GEMINI_MODEL ในโฮสต์เพื่อเปลี่ยนโมเดลได้
+// ลำดับโมเดลที่จะลอง: ตัวที่ตั้งใน GEMINI_MODEL ก่อน แล้วตามด้วยรุ่นสำรอง
+const GEMINI_MODELS = [...new Set([
+    process.env.GEMINI_MODEL, 'gemini-4-hydrogen', 'gemini-3.8-flash', 'gemini-flash-latest'
+].filter(Boolean))];
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-/** ส่งรูป + คำสั่งไปให้ Gemini แล้วได้ JSON กลับมา (ต้องตั้งค่า GEMINI_API_KEY ในโฮสต์) */
+/**
+ * ส่งรูป + คำสั่งไปให้ Gemini แล้วได้ JSON กลับมา
+ *  - 503/429 (คนใช้เยอะ/โควตา) → ลองโมเดลเดิมซ้ำ 3 ครั้ง แล้วไปโมเดลถัดไป
+ *  - 404 (โมเดลไม่มีแล้ว) → ไปโมเดลถัดไปทันที
+ *  - ข้อผิดพลาดอื่น (คีย์ผิด ฯลฯ) → หยุดทันที
+ */
 async function askGemini(parts) {
     const key = process.env.GEMINI_API_KEY;
     if (!key) throw new Error('ยังไม่ได้ตั้งค่า GEMINI_API_KEY');
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', 'x-goog-api-key': key },
-        body: JSON.stringify({
-            contents: [{ parts }],
-            generationConfig: { responseMimeType: 'application/json', temperature: 0 }
-        }),
-        signal: AbortSignal.timeout(20000)
-    });
-    if (!res.ok) {
-        const body = (await res.text().catch(() => '')).slice(0, 200);
-        throw new Error(`Gemini API ตอบ ${res.status}: ${body}`);
+    const payload = JSON.stringify({ contents: [{ parts }], generationConfig: { responseMimeType: 'application/json', temperature: 0 } });
+    let lastErr = 'ไม่ทราบสาเหตุ';
+
+    for (const model of GEMINI_MODELS) {
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', 'x-goog-api-key': key },
+                body: payload,
+                signal: AbortSignal.timeout(20000)
+            });
+            if (res.ok) {
+                const json = await res.json();
+                const text = (json.candidates?.[0]?.content?.parts ?? []).map(p => p.text ?? '').join('').trim();
+                if (!text) throw new Error('Gemini ไม่ได้ส่งผลลัพธ์กลับมา');
+                return JSON.parse(text.replace(/```json|```/g, '').trim());
+            }
+            const body = (await res.text().catch(() => '')).slice(0, 200);
+            lastErr = `${model} ตอบ ${res.status}: ${body}`;
+            if (res.status === 404) break;                               // โมเดลนี้ไม่มีแล้ว → ไปตัวถัดไป
+            if (res.status !== 503 && res.status !== 429) throw new Error(lastErr);   // ผิดพลาดถาวร หยุดเลย
+            if (attempt < 3) await sleep(attempt * 3000);
+        }
     }
-    const json = await res.json();
-    const text = (json.candidates?.[0]?.content?.parts ?? []).map(p => p.text ?? '').join('').trim();
-    if (!text) throw new Error('Gemini ไม่ได้ส่งผลลัพธ์กลับมา');
-    return JSON.parse(text.replace(/```json|```/g, '').trim());
+    throw new Error(lastErr);
 }
 
 /** แปลงไฟล์แนบของดิสคอร์ดเป็นชิ้นข้อมูลรูปสำหรับ Gemini */
