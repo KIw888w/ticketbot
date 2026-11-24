@@ -656,12 +656,68 @@ client.on('messageCreate', async (message) => {
         const args    = message.content.trim().split(/ +/);
         const command = args[0].toLowerCase();
 
-        const ADMIN_COMMANDS = ['!setupshop', '!qr', '!points', '!addpoints', '!addcredit', '!rewards', '!pointlog', '!undo', '!topbuyer', '!setstock', '!stock', '!randompanel', '!shoppanel'];
+        const ADMIN_COMMANDS = ['!setupshop', '!qr', '!points', '!addpoints', '!addcredit', '!rewards', '!pointlog', '!undo', '!topbuyer', '!setstock', '!stock', '!randompanel', '!shoppanel', '!rate', '!ratepanel'];
         if (!ADMIN_COMMANDS.includes(command)) return;
 
         // แจ้งเตือนชัดเจนแทนการเงียบ เผื่อ role ไม่ตรง จะได้รู้ทันทีว่าปัญหาคืออะไร
         if (!message.member || !message.member.roles.cache.has(ADMIN_ROLE_ID)) {
             return message.reply(`❌ คุณไม่มีสิทธิ์ใช้คำสั่งนี้ครับ (ต้องมี role ไอดี \`${ADMIN_ROLE_ID}\`)`);
+        }
+
+        // !rate list | !rate add ชื่อ | ราคาDiscord | ราคาร้าน | !rate del ชื่อ  (จัดการเรทจากดิสคอร์ด)
+        if (command === '!rate') {
+            const body = message.content.trim().slice('!rate'.length).trim();
+            const sub  = (body.split(/\s+/)[0] ?? '').toLowerCase();
+            const rest = body.slice(sub.length).trim();
+            const rates = loadRates();
+            const reply = (content) => message.reply({ content, allowedMentions: { parse: [] } });
+            const save = (list) => { writeAtomic(RATES_FILE, JSON.stringify(list, null, 2)); };
+            const USAGE = '📘 วิธีใช้ `!rate`\n' +
+                '• `!rate list` — ดูเรททั้งหมด\n' +
+                '• `!rate add ชื่อสินค้า | ราคา Discord | ราคาร้านขาย` — เพิ่ม (ถ้ามีชื่อนี้อยู่แล้วจะแก้ราคาให้)\n' +
+                '• `!rate del ชื่อสินค้า` — ลบ\n' +
+                'ตัวอย่าง: `!rate add บันเดิล Venom | 739 | 270`';
+
+            if (sub === 'list') {
+                if (!rates.length) return reply('ยังไม่มีเรทในระบบ');
+                const lines = rates.slice(0, 40).map(r => `• ${r.name} | Discord ${r.discordPrice} → ร้าน ${r.shopPrice}`);
+                return reply(`📋 เรททั้งหมด (${rates.length} รายการ)\n${lines.join('\n')}`);
+            }
+
+            if (sub === 'add') {
+                const parts = rest.split('|').map(p => p.trim());
+                if (parts.length !== 3 || !parts[0]) return reply(USAGE);
+                const name = parts[0].slice(0, 100);
+                const discordPrice = Number(parts[1]);
+                const shopPrice = Number(parts[2]);
+                if (!Number.isInteger(discordPrice) || discordPrice <= 0 || !Number.isFinite(shopPrice) || shopPrice < 0)
+                    return reply('❌ ราคาต้องเป็นตัวเลข (ราคา Discord เป็นจำนวนเต็มมากกว่า 0)\n' + USAGE);
+                const key = name.toLowerCase();
+                const idx = rates.findIndex(r => String(r.name).toLowerCase() === key);
+                const entry = { name, discordPrice, shopPrice };
+                if (idx >= 0) rates[idx] = entry; else rates.push(entry);
+                try { save(rates); }
+                catch (err) { console.error('❌ บันทึกเรทไม่สำเร็จ:', err); return reply('❌ บันทึกเรทไม่สำเร็จ ลองใหม่อีกครั้ง'); }
+                return reply(`✅ ${idx >= 0 ? 'แก้' : 'เพิ่ม'}เรท **${name}** → Discord ${discordPrice} / ร้าน ${shopPrice}`);
+            }
+
+            if (sub === 'del') {
+                if (!rest) return reply(USAGE);
+                const key = rest.toLowerCase();
+                const next = rates.filter(r => String(r.name).toLowerCase() !== key);
+                if (next.length === rates.length) return reply(`❌ ไม่พบ **${rest}** ในเรท`);
+                try { save(next); }
+                catch (err) { console.error('❌ บันทึกเรทไม่สำเร็จ:', err); return reply('❌ บันทึกเรทไม่สำเร็จ ลองใหม่อีกครั้ง'); }
+                return reply(`🗑️ ลบ **${rest}** แล้ว`);
+            }
+
+            return reply(USAGE);
+        }
+
+        // !ratepanel → โพสต์พาเนลจัดการเรท (ข้อมูลยังอยู่แม้กดเข้าใหม่)
+        if (command === '!ratepanel') {
+            await message.channel.send({ ...buildRatePanel(), allowedMentions: { parse: [] } });
+            return message.delete().catch(() => {});
         }
 
         // !setupshop → โพสต์ปุ่มเปิดตั๋ว
@@ -1062,6 +1118,67 @@ client.on('interactionCreate', async (interaction) => {
             return interaction.followUp({ content: `✅ ส่งรางวัล \`#${rw.id}\` แล้ว`, ephemeral: true });
         }
 
+        // ── พาเนลเรท: ปุ่มและฟอร์ม (เฉพาะแอดมิน) ──
+        if ((interaction.isButton() || interaction.isModalSubmit()) && /^rate_/.test(interaction.customId)) {
+            if (!interaction.member?.roles.cache.has(ADMIN_ROLE_ID))
+                return interaction.reply({ content: '❌ เฉพาะแอดมินเท่านั้น', ephemeral: true });
+
+            if (interaction.isButton() && interaction.customId === 'rate_refresh')
+                return interaction.update(buildRatePanel());
+
+            if (interaction.isButton() && interaction.customId === 'rate_add') {
+                const modal = new ModalBuilder().setCustomId('rate_add_modal').setTitle('เพิ่ม/แก้สินค้า').addComponents(
+                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('name').setLabel('ชื่อสินค้า')
+                        .setStyle(TextInputStyle.Short).setMaxLength(100).setRequired(true)),
+                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('discord').setLabel('ราคา Discord (ไม่มี Nitro)')
+                        .setStyle(TextInputStyle.Short).setPlaceholder('เช่น 739').setRequired(true)),
+                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('shop').setLabel('ราคาร้านขาย')
+                        .setStyle(TextInputStyle.Short).setPlaceholder('เช่น 270').setRequired(true))
+                );
+                return interaction.showModal(modal);
+            }
+
+            if (interaction.isButton() && interaction.customId === 'rate_del') {
+                const modal = new ModalBuilder().setCustomId('rate_del_modal').setTitle('ลบสินค้า').addComponents(
+                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('name').setLabel('ชื่อสินค้าที่ต้องการลบ')
+                        .setStyle(TextInputStyle.Short).setMaxLength(100).setRequired(true))
+                );
+                return interaction.showModal(modal);
+            }
+
+            if (interaction.isModalSubmit() && interaction.customId === 'rate_add_modal') {
+                const name = interaction.fields.getTextInputValue('name').trim().slice(0, 100);
+                const discordPrice = parsePrice(interaction.fields.getTextInputValue('discord'), false);
+                const shopPrice = parsePrice(interaction.fields.getTextInputValue('shop'));
+                if (!name || discordPrice === null || shopPrice === null)
+                    return interaction.reply({ content: '❌ ข้อมูลไม่ถูกต้อง: ราคาต้องเป็นตัวเลขจำนวนเต็ม (ราคา Discord มากกว่า 0)', ephemeral: true });
+
+                const rates = loadRates();
+                const idx = rates.findIndex(r => String(r.name).toLowerCase() === name.toLowerCase());
+                if (idx >= 0) rates[idx] = { name, discordPrice, shopPrice }; else rates.push({ name, discordPrice, shopPrice });
+                try { writeAtomic(RATES_FILE, JSON.stringify(rates, null, 2)); }
+                catch (err) { console.error('❌ บันทึกเรทไม่สำเร็จ:', err); return interaction.reply({ content: '❌ บันทึกไม่สำเร็จ ลองใหม่อีกครั้ง', ephemeral: true }); }
+
+                await interaction.reply({ content: `✅ ${idx >= 0 ? 'แก้' : 'เพิ่ม'} **${name}** แล้ว`, ephemeral: true });
+                if (interaction.message) await interaction.message.edit(buildRatePanel()).catch(() => {});
+                return;
+            }
+
+            if (interaction.isModalSubmit() && interaction.customId === 'rate_del_modal') {
+                const name = interaction.fields.getTextInputValue('name').trim();
+                const rates = loadRates();
+                const next = rates.filter(r => String(r.name).toLowerCase() !== name.toLowerCase());
+                if (next.length === rates.length)
+                    return interaction.reply({ content: `❌ ไม่พบ **${name}** ในเรท`, ephemeral: true });
+                try { writeAtomic(RATES_FILE, JSON.stringify(next, null, 2)); }
+                catch (err) { console.error('❌ บันทึกเรทไม่สำเร็จ:', err); return interaction.reply({ content: '❌ บันทึกไม่สำเร็จ ลองใหม่อีกครั้ง', ephemeral: true }); }
+
+                await interaction.reply({ content: `🗑️ ลบ **${name}** แล้ว`, ephemeral: true });
+                if (interaction.message) await interaction.message.edit(buildRatePanel()).catch(() => {});
+                return;
+            }
+        }
+
         // ── กดปิดห้อง: เริ่มอ่านชื่อสินค้าจากรูปล่วงหน้า แล้วให้เลือกประเภท (ปิดซ้ำได้) ──
         if (interaction.isButton() && interaction.customId === 'btn_done') {
             const data = activeTicketData[interaction.channel.id];
@@ -1170,36 +1287,42 @@ client.on('interactionCreate', async (interaction) => {
 const RATE_CHECK_CHANNEL_ID = '1574745487490285699';
 const RATE_SHOP_NAME        = 'Comet New';
 
-// ราคา Discord (ไม่มี Nitro) → ราคาร้านรับกด  (ประกาศ 2026-11-06)
-const FRAME_RATES = {
-    single: { 209: 45, 250: 55, 295: 80, 339: 90, 359: 95, 380: 110, 425: 120, 440: 130, 459: 160, 475: 170, 539: 200 },
-    2:      { 380: 100, 440: 130, 475: 140, 490: 150, 510: 160, 539: 170, 560: 180, 589: 220, 639: 260, 689: 270, 739: 285, 860: 345 },
-    3:      { 475: 115, 539: 130, 589: 200, 660: 220, 710: 255, 739: 260, 789: 310, 860: 375, 1010: 475 },
-    4:      { 560: 150, 660: 170 },
-    5:      {}   // ยังไม่มีเรทบันเดิล 5 ในประกาศล่าสุด
-};
+// ไฟล์เรทที่แอดมินแก้เองได้: rates.json  รูปแบบ: [{"name":"บันเดิล Venom","discordPrice":739,"shopPrice":270}, ...]
+const RATES_FILE = require('path').join(__dirname, 'rates.json');
 
-/** ให้ Gemini อ่านการ์ดสินค้าจากรูป → { name, qty, price } (ราคา Discord ไม่มี Nitro) */
-async function readRateCard(attachment) {
-    const part = await attachmentToPart(attachment);
-    if (!part) return { name: null, qty: 1, price: null };
-    const out = await askVision([part, { text:
-        'ภาพนี้เป็นการ์ดสินค้าจากร้านค้าดิสคอร์ด ให้อ่าน 3 อย่างแล้วตอบเป็น JSON อย่างเดียว ' +
-        '{"name": "ชื่อสินค้า (ตามบรรทัดชื่อบันเดิลหรือชื่อสินค้า)", "qty": จำนวนชิ้นในบันเดิล (ตัวเลข 1 ถ้าเป็นชิ้นเดียว), ' +
-        '"price": ราคาในบรรทัด "ไม่มี Nitro" เป็นตัวเลขไม่มีคอมมา เช่น 589} ' +
-        'ถ้าอ่านค่าไหนไม่ได้ให้ใส่ null' }]);
-    const qty   = Number.isInteger(out.qty) ? out.qty : 1;
-    const price = typeof out.price === 'number' ? Math.round(out.price) : null;
-    const name  = typeof out.name === 'string' && out.name.trim() ? out.name.trim().slice(0, 100) : null;
-    return { name, qty, price };
+/** โหลดเรททุกครั้งที่ใช้ (แก้ไฟล์แล้วมีผลทันทีโดยไม่ต้องรีสตาร์ท) */
+function loadRates() {
+    try {
+        const data = JSON.parse(require('fs').readFileSync(RATES_FILE, 'utf-8'));
+        return Array.isArray(data) ? data : [];
+    } catch (err) {
+        if (err.code !== 'ENOENT') console.error('❌ อ่าน rates.json ไม่ได้:', err.message);
+        return [];
+    }
 }
 
-/** ค้นเรทตามจำนวนชิ้นและราคา (ตรงตัวเลขเท่านั้น) */
-function lookupFrameRate(qty, price) {
-    const table = FRAME_RATES[qty === 1 ? 'single' : String(qty)];
-    if (!table || !Object.keys(table).length) return { status: 'no_rate' };
-    const rate = table[price];
-    return rate == null ? { status: 'not_found' } : { status: 'ok', rate };
+/** ให้ Gemini/Groq อ่านแค่ชื่อสินค้า และราคาในบรรทัด "ไม่มี Nitro" จากรูป */
+async function readRateCard(attachment) {
+    const part = await attachmentToPart(attachment);
+    if (!part) return { name: null, price: null };
+    const out = await askVision([part, { text:
+        'ภาพนี้เป็นการ์ดสินค้าจากร้านค้าดิสคอร์ด ให้อ่าน 2 อย่างแล้วตอบเป็น JSON อย่างเดียว ' +
+        '{"name": "ชื่อสินค้า (ตามบรรทัดชื่อบันเดิลหรือชื่อสินค้า)", ' +
+        '"price": ราคาในบรรทัด "ไม่มี Nitro" เป็นตัวเลขไม่มีคอมมา เช่น 739} ' +
+        'ถ้าอ่านค่าไหนไม่ได้ให้ใส่ null' }]);
+    const price = typeof out.price === 'number' ? Math.round(out.price) : null;
+    const name  = typeof out.name === 'string' && out.name.trim() ? out.name.trim().slice(0, 100) : null;
+    return { name, price };
+}
+
+/** หาสินค้าในเรทจากราคา Discord (ไม่มี Nitro) — ถ้าราคาซ้ำให้เลือกจากชื่อที่คล้ายที่สุด */
+function lookupRate(name, price) {
+    const same = loadRates().filter(r => Number(r.discordPrice) === price);
+    if (!same.length) return null;
+    if (same.length === 1) return same[0];
+    const norm = t => String(t).replace(/\s+/g, '').toLowerCase();
+    const hit = same.find(r => norm(name).includes(norm(r.name)) || norm(r.name).includes(norm(name)));
+    return hit ?? same[0];
 }
 
 async function handleRateCheck(message) {
@@ -1211,32 +1334,27 @@ async function handleRateCheck(message) {
         try {
             card = await readRateCard(a);
         } catch (err) {
-            console.error('❌ อ่านการ์ดด้วย Gemini ไม่สำเร็จ:', err.message);
+            console.error('❌ อ่านการ์ดไม่สำเร็จ:', err.message);
             await message.reply({
                 content: `⚠️ อ่านรูปนี้ตอนนี้ไม่ได้ (${err.message}) <@&${ADMIN_ROLE_ID}> ช่วยตรวจราคาให้หน่อยครับ`,
                 allowedMentions: { roles: [ADMIN_ROLE_ID], repliedUser: false }
             });
             continue;
         }
-        const { name, qty, price } = card;
-        const title = `(จำนวน ${images.length} รูป)`;
+        const { name, price } = card;
 
         if (!name || price == null) {
             await message.reply({
-                content: `⚠️ อ่านรูปนี้ไม่ครบ (ชื่อหรือราคาอ่านไม่ได้) <@&${ADMIN_ROLE_ID}> ช่วยตรวจราคาให้หน่อยครับ`,
+                content: `⚠️ อ่านชื่อหรือราคาจากรูปนี้ไม่ได้ <@&${ADMIN_ROLE_ID}> ช่วยตรวจราคาให้หน่อยครับ`,
                 allowedMentions: { roles: [ADMIN_ROLE_ID], repliedUser: false }
             });
             continue;
         }
 
-        const res = lookupFrameRate(qty, price);
-        if (res.status === 'no_rate') {
-            await message.reply({ content: `ยังไม่มีเรทสำหรับ **บันเดิล ${qty}** ของ ${RATE_SHOP_NAME} ครับ`, allowedMentions: { repliedUser: false } });
-            continue;
-        }
-        if (res.status === 'not_found') {
+        const rate = lookupRate(name, price);
+        if (!rate) {
             await message.reply({
-                content: `⚠️ ไม่พบราคา ${price} บาท ในเรทของ ${RATE_SHOP_NAME} กรุณาแอดมินตรวจ <@&${ADMIN_ROLE_ID}>`,
+                content: `⚠️ ไม่พบราคา ${price} บาท ในระบบ กรุณาแอดมินตรวจ <@&${ADMIN_ROLE_ID}>`,
                 allowedMentions: { roles: [ADMIN_ROLE_ID], repliedUser: false }
             });
             continue;
@@ -1244,16 +1362,40 @@ async function handleRateCheck(message) {
 
         const embed = new EmbedBuilder()
             .setColor('#E74C3C')
-            .setTitle(`✅ ตรวจสอบราคาสินค้า ${title}`)
+            .setTitle(`✅ ตรวจสอบราคาสินค้า (จำนวน ${images.length} รูป)`)
             .addFields(
-                { name: 'ชื่อสินค้า', value: name, inline: false },
-                { name: 'ประเภท', value: qty === 1 ? 'ชิ้นเดียว' : `บันเดิล ${qty}`, inline: true },
+                { name: 'ชื่อสินค้า', value: rate.name || name, inline: false },
                 { name: 'ราคา Discord (ไม่มี Nitro)', value: `${price.toFixed(2)} บาท`, inline: false },
-                { name: `ราคาร้านรับกด (${RATE_SHOP_NAME})`, value: `${res.rate.toFixed(2)} บาท`, inline: false }
-            )
-            .setFooter({ text: RATE_SHOP_NAME });
+                { name: 'ราคาร้านขาย', value: `${Number(rate.shopPrice).toFixed(2)} บาท`, inline: false }
+            );
         await message.reply({ embeds: [embed], allowedMentions: { repliedUser: false } });
     }
+}
+
+/** พาเนลจัดการเรท: embed รายการสินค้า + ปุ่ม เพิ่ม/ลบ/รีเฟรช (ข้อมูลอ่านจาก rates.json ทุกครั้ง) */
+function buildRatePanel() {
+    const rates = loadRates();
+    const shown = rates.slice(0, 25).map((r, i) =>
+        `**${i + 1}. ${r.name}**\n┗ Discord ${r.discordPrice} บาท → ร้านขาย ${r.shopPrice} บาท`);
+    const more = rates.length > 25 ? `\nและอีก ${rates.length - 25} รายการ` : '';
+    const embed = new EmbedBuilder()
+        .setColor('#9B59B6')
+        .setTitle('📋 จัดการเรทสินค้า')
+        .setDescription(rates.length ? shown.join('\n') + more : 'ยังไม่มีสินค้าในเรท กดปุ่ม **เพิ่ม/แก้สินค้า** เพื่อเริ่ม')
+        .setFooter({ text: `ทั้งหมด ${rates.length} รายการ` });
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('rate_add').setLabel('เพิ่ม/แก้สินค้า').setEmoji('➕').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId('rate_del').setLabel('ลบสินค้า').setEmoji('🗑️').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId('rate_refresh').setLabel('รีเฟรช').setStyle(ButtonStyle.Secondary)
+    );
+    return { embeds: [embed], components: [row] };
+}
+
+/** แปลงค่าราคาจากฟอร์ม: ตัวเลขจำนวนเต็ม ไม่ติดลบ (discord ต้องมากกว่า 0) */
+function parsePrice(text, allowZero = true) {
+    const n = Number(String(text).replace(/,/g, '').trim());
+    if (!Number.isInteger(n) || n < 0 || (!allowZero && n === 0)) return null;
+    return n;
 }
 
 client.login(process.env.DISCORDTOKEN || process.env.TOKEN);
