@@ -219,7 +219,7 @@ function rollSpin() {
 const ocrResult = new Map();
 
 const OCR_MIME = ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'];   // รูปแบบที่ Gemini รับ
-const GEMINI_MODEL = 'gemini-2.5-flash';   // ถ้า Google เปลี่ยนชื่อโมเดล แก้ตรงนี้
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-flash-latest';   // ตั้ง GEMINI_MODEL ในโฮสต์เพื่อเปลี่ยนโมเดลได้
 
 /** ส่งรูป + คำสั่งไปให้ Gemini แล้วได้ JSON กลับมา (ต้องตั้งค่า GEMINI_API_KEY ในโฮสต์) */
 async function askGemini(parts) {
@@ -234,7 +234,10 @@ async function askGemini(parts) {
         }),
         signal: AbortSignal.timeout(20000)
     });
-    if (!res.ok) throw new Error(`Gemini API ตอบ ${res.status}`);
+    if (!res.ok) {
+        const body = (await res.text().catch(() => '')).slice(0, 200);
+        throw new Error(`Gemini API ตอบ ${res.status}: ${body}`);
+    }
     const json = await res.json();
     const text = (json.candidates?.[0]?.content?.parts ?? []).map(p => p.text ?? '').join('').trim();
     if (!text) throw new Error('Gemini ไม่ได้ส่งผลลัพธ์กลับมา');
