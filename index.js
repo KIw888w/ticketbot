@@ -107,6 +107,7 @@ function loadJSON(filePath, fallback = {}) {
         return JSON.parse(fs.readFileSync(filePath, 'utf8'));
     } catch (err) {
         console.error(`❌ โหลดไฟล์ ${filePath} ไม่ได้`, err);
+        try { fs.copyFileSync(filePath, filePath + '.corrupt-' + Date.now()); } catch (_) {}
         return fallback;
     }
 }
@@ -123,13 +124,15 @@ function loadPersistentData() {
     if (reviewFile && typeof reviewFile.count === 'number') reviewCount = reviewFile.count;
 }
 
-function saveTickets()     { fs.writeFileSync(TICKET_FILE, JSON.stringify(activeTicketData, null, 2)); }
-function saveQueue()       { fs.writeFileSync(QUEUE_FILE, queueCount.toString()); }
-function savePoints()      { fs.writeFileSync(POINTS_FILE, JSON.stringify(pointsData, null, 2)); }
-function saveRewards()     { fs.writeFileSync(REWARDS_FILE, JSON.stringify(rewardsData, null, 2)); }
-function saveLeaderboard() { fs.writeFileSync(LEADERBOARD_FILE, JSON.stringify(leaderboardData, null, 2)); }
-function saveShop()        { fs.writeFileSync(SHOP_FILE, JSON.stringify(shopData, null, 2)); }
-function saveReviewCount() { fs.writeFileSync(REVIEW_COUNT_FILE, JSON.stringify({ count: reviewCount })); }
+/** เขียนไฟล์แบบปลอดภัย: เขียนไฟล์ .tmp ก่อนแล้วค่อยเปลี่ยนชื่อ (กันไฟล์พังตอนบอทดับกลางคัน) */
+function writeAtomic(file, text) { const tmp = file + '.tmp'; fs.writeFileSync(tmp, text); fs.renameSync(tmp, file); }
+function saveTickets()     { writeAtomic(TICKET_FILE, JSON.stringify(activeTicketData, null, 2)); }
+function saveQueue()       { writeAtomic(QUEUE_FILE, queueCount.toString()); }
+function savePoints()      { writeAtomic(POINTS_FILE, JSON.stringify(pointsData, null, 2)); }
+function saveRewards()     { writeAtomic(REWARDS_FILE, JSON.stringify(rewardsData, null, 2)); }
+function saveLeaderboard() { writeAtomic(LEADERBOARD_FILE, JSON.stringify(leaderboardData, null, 2)); }
+function saveShop()        { writeAtomic(SHOP_FILE, JSON.stringify(shopData, null, 2)); }
+function saveReviewCount() { writeAtomic(REVIEW_COUNT_FILE, JSON.stringify({ count: reviewCount })); }
 
 loadPersistentData();
 
@@ -212,21 +215,158 @@ function rollSpin() {
     return SPIN_TABLE[SPIN_TABLE.length - 1];
 }
 
-/** ปิดห้องแบบมีผล: ตั้งเวลาลบ 1 วัน + โพสต์สรุป (และรางวัลสุ่ม) ไปห้องโชว์ */
-async function finishTicket(channel, data, { post = true } = {}) {
-    data.status  = 'done';
-    data.closeAt = Date.now() + CLOSE_DELAY_MS;
-    saveTickets();
-    scheduleClose(channel.id, CLOSE_DELAY_MS);
+/** ชื่อสินค้าที่อ่านจากรูปได้แล้ว: channelId -> string|null (เติมเมื่อ OCR เสร็จ) */
+const ocrResult = new Map();
 
-    if (post && data.productType !== 'cancel') {
-        const ch = await client.channels.fetch(PRODUCT_CHANNELS[data.productType]).catch(() => null);
-        if (ch) await ch.send({ embeds: [await buildOrderEmbed(data)], allowedMentions: { parse: [] } })
-            .catch(err => console.error('❌ โพสต์สรุปไปห้องโชว์ไม่สำเร็จ:', err.message));
-        else console.error(`❌ ไม่พบห้องโชว์สินค้า ${PRODUCT_CHANNELS[data.productType]}`);
+let ocrWorkerPromise = null;
+/** สร้าง worker ของ Tesseract ครั้งเดียว (ครั้งแรกจะดาวน์โหลดข้อมูลภาษาไทยก่อน) */
+function getOcrWorker() {
+    if (!ocrWorkerPromise) {
+        const { createWorker } = require('tesseract.js');
+        ocrWorkerPromise = createWorker('tha+eng').catch(err => { ocrWorkerPromise = null; throw err; });
     }
-    await sendSummaryDM(data);
-    await updateLeaderboard();
+    return ocrWorkerPromise;
+}
+
+const OCR_MIME = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp'];
+// บรรทัดที่น่าจะเป็นข้อความสลิป/การเงิน ไม่ใช่ชื่อสินค้า
+const OCR_SKIP = /(โอน|บาท|สลิป|slip|promptpay|พร้อมเพย์|ref|เลขที่|รายการ|จำนวน|ธนาคาร|วันที่|เวลา|\d{1,2}:\d{2}|\d{6,})/i;
+
+/** เลือกบรรทัดที่น่าจะเป็นชื่อสินค้า (เอาบรรทัดที่มีตัวอักษรมากสุดหลังกรองสลิปออก) */
+function pickProductLine(text) {
+    const lines = text.split('\n')
+        .map(l => l.replace(/[|=_~•·“”"'`]+/g, ' ').replace(/\s+/g, ' ').trim())
+        .filter(l => l.length >= 3 && /[\u0E00-\u0E7Fa-zA-Z]/.test(l) && !OCR_SKIP.test(l));
+    if (!lines.length) return null;
+    lines.sort((x, y) => y.replace(/[^\u0E00-\u0E7Fa-zA-Z]/g, '').length - x.replace(/[^\u0E00-\u0E7Fa-zA-Z]/g, '').length);
+    return lines[0].slice(0, 100);
+}
+
+/** อ่านรูปที่ลูกค้าส่งในห้องตั๋ว (สูงสุด 3 รูปล่าสุด) ด้วย Tesseract ในเครื่อง — ไม่มีรูป/อ่านไม่ได้ → null */
+async function readProductNameFromTicket(channel, ownerId) {
+    if (!ownerId) return null;
+    const msgs = await channel.messages.fetch({ limit: 50 });
+    const images = [];
+    for (const m of msgs.values()) {                       // ใหม่ → เก่า
+        if (m.author.id !== ownerId) continue;
+        for (const a of m.attachments.values()) {
+            if (images.length < 3 && OCR_MIME.includes(a.contentType?.split(';')[0])) images.push(a);
+        }
+        if (images.length >= 3) break;
+    }
+    if (!images.length) return null;
+
+    const worker = await getOcrWorker();
+    let text = '';
+    for (const a of images) {
+        const r = await fetch(a.url, { signal: AbortSignal.timeout(8000) });
+        if (!r.ok) continue;
+        const { data } = await worker.recognize(Buffer.from(await r.arrayBuffer()));
+        text += '\n' + (data?.text ?? '');
+    }
+    return pickProductLine(text);
+}
+
+function pointsRecord(userId) { return (pointsData[userId] ??= { points: 0, totalSpent: 0, history: [] }); }
+function pushHistory(rec, entry) { (rec.history ??= []).push(entry); if (rec.history.length > 200) rec.history.shift(); }
+
+/** คืนแต้มที่เคยให้จากตั๋วนี้ (ใช้ตอนปิดซ้ำ/ยกเลิก) — แก้ใน memory เท่านั้น ยังไม่เซฟ */
+function revokeAwardInMemory(data) {
+    const a = data.award;
+    if (!a) return;
+    const rec = pointsData[a.userId];
+    if (rec) {
+        rec.points     = Math.max(0, (rec.points || 0) - a.points);
+        rec.totalSpent = Math.max(0, (rec.totalSpent || 0) - a.amount);
+        const h = (rec.history ?? []).find(x => x.orderNo === a.orderNo);
+        if (h) { h.undone = true; h.undoneAt = Date.now(); h.undoneBy = 'reclose'; }
+    }
+    data.award = null;
+}
+
+/** ปรับแต้มด้วยมือ (!addcredit/!addpoints) — ถ้าเซฟไม่ได้จะคืนค่าเดิม */
+function applyManualPoints(userId, n, byUserId) {
+    const backup = JSON.stringify(pointsData);
+    const rec = pointsRecord(userId);
+    const before = rec.points ?? 0;
+    if (before + n < 0) return { ok: false, before, after: before };
+    try {
+        rec.points = before + n;
+        pushHistory(rec, { ts: Date.now(), orderNo: `ADJ-${Date.now().toString(36).toUpperCase()}`, product: 'adjust',
+            productName: 'ปรับแต้มด้วยมือ', amount: 0, points: n, rewards: [], balance: rec.points, undone: false, by: byUserId });
+        savePoints();
+        return { ok: true, before, after: rec.points };
+    } catch (err) {
+        pointsData = JSON.parse(backup);
+        throw err;
+    }
+}
+
+/**
+ * ปิดห้อง / ปิดซ้ำ / ยกเลิก
+ *  - ปิดซ้ำได้เสมอ: แต้มเดิมของตั๋วนี้จะถูกคืนแล้วคำนวณใหม่
+ *  - ขั้นที่อาจ error (โพสต์โชว์) ทำก่อน ถ้า error → throw ออกไป และ "ไม่มีการเปลี่ยนแต้มเลย"
+ *  - ถ้าขั้นเซฟ error → คืนข้อมูลเดิมทั้งหมด (แต้ม + ตั๋ว) และลบโพสต์โชว์ที่เพิ่งโพสต์
+ */
+async function commitClose(channel, data, { type = null, productName = '', cancel = false } = {}) {
+    const isCancel  = cancel === true;
+    const price     = isCancel ? 0 : (Number(data.price) || 0);
+    const pts       = Math.floor(price * POINTS_PER_ITEM);
+    const giveAward = !isCancel && !!data.userId;
+    const awardPts  = giveAward ? pts : 0;
+    const orderNo   = newOrderNo(isCancel ? 'cancel' : type);
+    const reclosed  = !!data.award;
+    const oldShowcase = data.showcase ?? null;
+
+    const curPts      = pointsData[data.userId]?.points ?? 0;
+    const balanceAfter = giveAward ? Math.max(0, curPts - (data.award?.points ?? 0)) + awardPts : 0;
+
+    // 1) ขั้นที่อาจ error — ทำก่อนแตะข้อมูลจริง
+    const snap = { ...data, productType: isCancel ? 'cancel' : type, productName: isCancel ? '-' : productName,
+        price, orderNo, pointsEarned: awardPts, pointsBalance: balanceAfter, rewards: [], closeAt: Date.now() };
+    let showMsg = null;
+    if (!isCancel) {
+        const showCh = await client.channels.fetch(PRODUCT_CHANNELS[type]);
+        showMsg = await showCh.send({ embeds: [await buildOrderEmbed(snap)], allowedMentions: { parse: [] } });
+    }
+
+    // 2) ทุกอย่างผ่านแล้ว → แก้แต้มและข้อมูลตั๋ว (ซิงโครนัส) ถ้าเซฟพังจะคืนค่าเดิม
+    const backupPts = JSON.stringify(pointsData);
+    const backupTix = JSON.stringify(activeTicketData);
+    try {
+        revokeAwardInMemory(data);
+        if (giveAward) {
+            const rec = pointsRecord(data.userId);
+            rec.points     = (rec.points || 0) + awardPts;
+            rec.totalSpent = (rec.totalSpent || 0) + price;
+            pushHistory(rec, { ts: Date.now(), orderNo, product: isCancel ? 'cancel' : type, productName: snap.productName,
+                amount: price, points: awardPts, rewards: [], balance: rec.points, undone: false });
+            data.award = { userId: data.userId, points: awardPts, amount: price, orderNo };
+        }
+        Object.assign(data, {
+            productType: snap.productType, productName: snap.productName, amount: price, orderNo,
+            pointsEarned: awardPts, pointsBalance: giveAward ? pointsData[data.userId].points : 0,
+            rewards: [], status: 'done', closeAt: Date.now() + CLOSE_DELAY_MS,
+            showcase: showMsg ? { channelId: showMsg.channel.id, messageId: showMsg.id } : null
+        });
+        savePoints();
+        saveTickets();
+    } catch (err) {
+        pointsData = JSON.parse(backupPts);
+        activeTicketData = JSON.parse(backupTix);
+        if (showMsg) await showMsg.delete().catch(() => {});
+        throw err;
+    }
+
+    // 3) ขั้นรอง (error ตรงนี้ไม่กระทบแต้ม)
+    if (oldShowcase) {
+        client.channels.fetch(oldShowcase.channelId)
+            .then(c => c.messages.delete(oldShowcase.messageId)).catch(() => {});
+    }
+    scheduleClose(channel.id, CLOSE_DELAY_MS);
+    await sendSummaryDM(data).catch(() => {});
+    await updateLeaderboard().catch(() => {});
+    return { pts: awardPts, balance: data.pointsBalance ?? 0, reclosed };
 }
 
 const spinRewardText = () => SPIN_TABLE
@@ -298,7 +438,7 @@ function buildRewardRows(userId) {
 function buildRewardEmbed(userId) {
     const pending = pendingRewardsOf(userId);
     if (!pending.length) return null;
-    const lines = pending.map(r => `• \`#${r.id}\` — ${PRODUCT_LABEL[r.type] ?? r.type}`).join('\n');join('\n');
+    const lines = pending.map(r => `• \`#${r.id}\` — ${PRODUCT_LABEL[r.type] ?? r.type}`).join('\n');
     return new EmbedBuilder().setColor('#E91E63').setTitle('🎁 รางวัลสะสมแต้มที่รอรับ')
         .setDescription(`${lines}\n\nแอดมินจะจัดส่งให้ และกดปุ่มด้านล่างเมื่อส่งเรียบร้อยแล้วครับ`);
 }
@@ -315,7 +455,8 @@ async function closeTicket(channelId) {
     } catch (err) {
         if (err.code !== 10003) { // 10003 = ห้องถูกลบไปแล้ว ถือว่าเสร็จ
             console.error(`❌ ลบตั๋ว ${channelId} ไม่สำเร็จ (เช็คสิทธิ์ Manage Channels):`, err.message);
-            return; // เก็บข้อมูลไว้ ลองใหม่ตอนบอทรีสตาร์ท
+            scheduleClose(channelId, 5 * 60 * 1000); // ลบไม่ได้ → ลองใหม่อีก 5 นาที
+            return;
         }
     }
 
@@ -369,6 +510,22 @@ client.once(Events.ClientReady, async () => {
         if (data.closeAt) scheduleClose(channelId, data.closeAt - Date.now());
     }
 
+    // ซิงค์เลขตั๋วใหม่: ไม่ให้ต่ำกว่าเลขที่เคยใช้ (จาก queue.txt, ตั๋วที่บันทึกไว้ และชื่อห้องที่มีอยู่จริง)
+    {
+        let maxNo = 0;
+        for (const d of Object.values(activeTicketData)) if ((d.qNum ?? 0) > maxNo) maxNo = d.qNum;
+        for (const ch of client.channels.cache.values()) {
+            if (!ch.parentId || ![TICKET_CATEGORY_ID, DONE_CATEGORY_ID].includes(ch.parentId)) continue;
+            const m = ch.name.match(/-(\d+)$/);
+            if (m) maxNo = Math.max(maxNo, parseInt(m[1], 10));
+        }
+        if (maxNo + 1 > queueCount) {
+            queueCount = maxNo + 1;
+            saveQueue();
+            console.log(`🔢 ตั้งเลขตั๋วถัดไปเป็น ${queueCount}`);
+        }
+    }
+
     // ซิงค์เลขรีวิวจากชื่อห้อง (กันนับใหม่จาก 0 ทับเลขเดิม) + ตรวจว่าบอทเข้าถึงห้องรีวิวได้
     try {
         const ch = await client.channels.fetch(REVIEW_CHANNEL_ID);
@@ -388,6 +545,12 @@ client.once(Events.ClientReady, async () => {
 // ==========================================
 client.on('messageCreate', async (message) => {
     if (!message.guild || message.author.bot) return;
+
+    // ── ห้องเช็คเรทกรอบรูป: รูปที่ไม่ได้ขึ้นต้นด้วย ! → อ่านราคาแล้วตอบกลับ ──
+    if (message.channel.id === RATE_CHECK_CHANNEL_ID && message.attachments.size && !message.content.startsWith('!')) {
+        handleRateCheck(message).catch(err => console.error('❌ เช็คเรทไม่สำเร็จ:', err));
+        return;
+    }
 
     // ── ระบบนับรีวิว (เช็คก่อนคำสั่ง เพื่อให้รีวิวที่ขึ้นต้นด้วย ! ก็นับ) ──
     if (message.channel.id === REVIEW_CHANNEL_ID) {
@@ -417,7 +580,7 @@ client.on('messageCreate', async (message) => {
         const args    = message.content.trim().split(/ +/);
         const command = args[0].toLowerCase();
 
-        const ADMIN_COMMANDS = ['!setupshop', '!qr', '!points', '!addpoints', '!rewards', '!pointlog', '!undo', '!topbuyer', '!setstock', '!stock', '!randompanel', '!shoppanel'];
+        const ADMIN_COMMANDS = ['!setupshop', '!qr', '!points', '!addpoints', '!addcredit', '!rewards', '!pointlog', '!undo', '!topbuyer', '!setstock', '!stock', '!randompanel', '!shoppanel'];
         if (!ADMIN_COMMANDS.includes(command)) return;
 
         // แจ้งเตือนชัดเจนแทนการเงียบ เผื่อ role ไม่ตรง จะได้รู้ทันทีว่าปัญหาคืออะไร
@@ -603,14 +766,15 @@ client.on('messageCreate', async (message) => {
         }
 
         // !addpoints @ลูกค้า จำนวน → เพิ่ม/ลดแต้มด้วยมือ (ใส่ -2 เพื่อลด)
-        if (command === '!addpoints') {
+        if (command === '!addpoints' || command === '!addcredit') {
             const target = message.mentions.users.first();
             const n      = parseInt(args[2], 10);
             if (!target || !Number.isFinite(n)) return message.reply('❌ รูปแบบ: `!addpoints @ลูกค้า จำนวน` (ลดแต้มใส่เลขติดลบ เช่น -2)');
-            const rec = (pointsData[target.id] ??= { points: 0 });
-            rec.points = Math.max(0, rec.points + n);
-            savePoints();
-            return message.reply(`✅ ปรับแต้ม ${target} ${n > 0 ? '+' : ''}${n} → คงเหลือ **${rec.points}** แต้ม`);
+            let r;
+            try { r = applyManualPoints(target.id, n, message.author.id); }
+            catch (err) { console.error('❌ ปรับแต้มไม่สำเร็จ:', err); return message.reply({ content: '❌ บันทึกแต้มไม่สำเร็จ ยังไม่มีการเปลี่ยนแต้ม ลองใหม่อีกครั้ง', allowedMentions: { parse: [] } }); }
+            if (!r.ok) return message.reply({ content: `❌ หักได้สูงสุด ${r.before} แต้ม (${target} มีอยู่ ${r.before} แต้ม)`, allowedMentions: { parse: [] } });
+            return message.reply({ content: `✅ ปรับแต้ม ${target} ${n > 0 ? '+' : ''}${n} → คงเหลือ **${r.after}** แต้ม`, allowedMentions: { parse: [] } });
         }
 
         return;
@@ -634,8 +798,10 @@ client.on('interactionCreate', async (interaction) => {
         if (interaction.isButton() && interaction.customId === 'create_ticket') {
             await interaction.deferReply({ ephemeral: true });
 
+            const ticketNo = queueCount++;   // จองเลขก่อน กันกดพร้อมกันแล้วได้เลขซ้ำ
+            saveQueue();
             const channel = await interaction.guild.channels.create({
-                name:   `ticket-${queueCount}`,
+                name:   `ticket-${ticketNo}`,
                 parent: TICKET_CATEGORY_ID,
                 permissionOverwrites: [
                     { id: interaction.guild.id, deny:  [PermissionFlagsBits.ViewChannel] },
@@ -649,13 +815,13 @@ client.on('interactionCreate', async (interaction) => {
                 label:        'Ticket',
                 price:        0,
                 userId:       interaction.user.id,
-                qNum:         queueCount,
+                qNum:         ticketNo,
                 payMethod:    'promptpay'
             };
             saveTickets();
 
             const embed = new EmbedBuilder()
-                .setTitle(`🎫 Ticket #${queueCount}`)
+                .setTitle(`🎫 Ticket #${ticketNo}`)
                 .setColor('#5865F2')
                 .setDescription(`สวัสดีครับ <@${interaction.user.id}>\n\nแจ้งรายละเอียดที่ต้องการได้เลยครับ รอแอดมินเข้ามาดำเนินการและแจ้งยอดชำระให้สักครู่นะครับ`);
 
@@ -671,9 +837,6 @@ client.on('interactionCreate', async (interaction) => {
                 components: [btns, ...buildRewardRows(interaction.user.id)]
             });
 
-            queueCount++;
-            saveQueue();
-
             return interaction.editReply({ content: `✅ สร้างตั๋วเรียบร้อยแล้ว! แตะที่นี่ได้เลย 👉 ${channel}` });
         }
 
@@ -682,9 +845,9 @@ client.on('interactionCreate', async (interaction) => {
         // ════════════════════════════════════════════════════════════
 
         if (interaction.isButton() && interaction.customId === 'btn_work') {
-            if (!interaction.member.roles.cache.has(ADMIN_ROLE_ID)) return;
+            if (!interaction.member.roles.cache.has(ADMIN_ROLE_ID)) return interaction.reply({ content: '❌ เฉพาะแอดมินเท่านั้นครับ', ephemeral: true });
             const data = activeTicketData[interaction.channel.id];
-            if (!data) return;
+            if (!data) return interaction.reply({ content: '❌ ไม่พบข้อมูลตั๋วของห้องนี้', ephemeral: true });
 
             await interaction.reply({ content: `👨‍💻 <@${interaction.user.id}> รับงานนี้แล้วครับ กำลังดำเนินการให้${data.userId ? ` <@${data.userId}>` : ''}` });
             data.accepted = true;
@@ -823,16 +986,23 @@ client.on('interactionCreate', async (interaction) => {
             return interaction.followUp({ content: `✅ ส่งรางวัล \`#${rw.id}\` แล้ว`, ephemeral: true });
         }
 
-        // ── กดปิดห้อง → เลือกประเภทสินค้า (Nitro / กรอบรูป) ──
+        // ── กดปิดห้อง: เริ่มอ่านชื่อสินค้าจากรูปล่วงหน้า แล้วให้เลือกประเภท (ปิดซ้ำได้) ──
         if (interaction.isButton() && interaction.customId === 'btn_done') {
             const data = activeTicketData[interaction.channel.id];
-            if (!data) return;
-
+            if (!data) return interaction.reply({ content: '❌ ไม่พบข้อมูลตั๋วของห้องนี้ (ข้อมูลอาจหายหลังบอทรีสตาร์ท)', ephemeral: true });
             if (!interaction.member.roles.cache.has(ADMIN_ROLE_ID))
                 return interaction.reply({ content: '❌ เฉพาะแอดมินเท่านั้นที่ปิดห้องได้ครับ', ephemeral: true });
 
+            if (!data.productName) {
+                ocrResult.delete(interaction.channel.id);
+                readProductNameFromTicket(interaction.channel, data.userId)
+                    .then(v => ocrResult.set(interaction.channel.id, v))
+                    .catch(err => { console.error('❌ อ่านชื่อสินค้าจากรูปไม่สำเร็จ:', err.message); ocrResult.set(interaction.channel.id, null); });
+            }
+
+            const note = data.award ? '\n♻️ ห้องนี้เคยปิดแล้ว การปิดซ้ำจะคืนแต้มเดิมและคำนวณใหม่ทั้งหมด' : '';
             return interaction.reply({
-                content: '📦 **เลือกประเภทสินค้าของออเดอร์นี้**\nราคาจะดึงจาก QR ที่สร้างไว้ให้อัตโนมัติ · ถ้าไม่ได้ซื้อ ให้กดยกเลิก (ไม่ได้แต้ม)',
+                content: '📦 **เลือกประเภทสินค้าของออเดอร์นี้**\nราคาจะดึงจาก QR ที่สร้างไว้ให้อัตโนมัติ · ถ้าไม่ได้ซื้อ ให้กดยกเลิก (ไม่ได้แต้ม)' + note,
                 components: [new ActionRowBuilder().addComponents(
                     new ButtonBuilder().setCustomId('close_type_nitro').setLabel('Nitro').setEmoji('🎁').setStyle(ButtonStyle.Primary),
                     new ButtonBuilder().setCustomId('close_type_frame').setLabel('กรอบรูป').setEmoji('🖼️').setStyle(ButtonStyle.Secondary),
@@ -848,70 +1018,57 @@ client.on('interactionCreate', async (interaction) => {
             if (!interaction.member.roles.cache.has(ADMIN_ROLE_ID)) return interaction.reply({ content: '❌ เฉพาะแอดมินเท่านั้นครับ', ephemeral: true });
             if (!data) return interaction.reply({ content: '❌ ไม่พบข้อมูลตั๋ว', ephemeral: true });
 
-            // ยกเลิก → ปิดห้องโดยไม่ให้แต้ม ไม่โพสต์โชว์
             if (interaction.customId === 'close_type_cancel') {
-                data.productType = 'cancel';
-                data.productName = '-';
-                data.orderNo     = newOrderNo('cancel');
-                data.pointsEarned = 0;
-                data.pointsBalance = pointsData[data.userId]?.points ?? 0;
-                await finishTicket(interaction.channel, data, { post: false });
-                await interaction.reply({ embeds: [new EmbedBuilder().setColor('#E74C3C').setTitle('❌ ยกเลิกออเดอร์แล้ว')
-                    .setDescription(`ออเดอร์นี้ถูกยกเลิก ไม่มีการให้แต้ม\nระบบจะลบห้องภายใน 1 วัน`)] });
-                return interaction.channel.setName(`❌-${data.qNum}`).catch(() => {});
+                await interaction.deferReply();
+                try {
+                    await commitClose(interaction.channel, data, { cancel: true });
+                } catch (err) {
+                    console.error('❌ ยกเลิกออเดอร์ไม่สำเร็จ:', err);
+                    return interaction.editReply({ content: '❌ ยกเลิกไม่สำเร็จ ยังไม่มีการเปลี่ยนแต้ม กรุณากดใหม่อีกครั้ง' });
+                }
+                interaction.channel.setName(`❌-${data.qNum}`).catch(() => {});
+                return interaction.editReply({ embeds: [new EmbedBuilder().setColor('#E74C3C').setTitle('❌ ยกเลิกออเดอร์แล้ว')
+                    .setDescription('ออเดอร์นี้ถูกยกเลิก ไม่มีการให้แต้ม (แต้มเดิมของตั๋วนี้ถูกคืนแล้ว ถ้ามี)\nระบบจะลบห้องภายใน 1 วัน')] });
             }
 
-            const type  = interaction.customId === 'close_type_nitro' ? 'nitro' : 'frame';
-            const modal = new ModalBuilder()
-                .setCustomId(`close_info_${type}`)
-                .setTitle('📦 ข้อมูลสินค้า')
-                .addComponents(
-                    new ActionRowBuilder().addComponents(
-                        new TextInputBuilder().setCustomId('product_name').setLabel('ชื่อสินค้า')
-                            .setStyle(TextInputStyle.Short).setPlaceholder('เช่น กากสุด').setMaxLength(100).setRequired(true)
-                    )
-                );
+            const type    = interaction.customId === 'close_type_nitro' ? 'nitro' : 'frame';
+            // ปิดซ้ำ → ใช้ชื่อเดิมที่แอดมินยืนยันแล้ว / ไม่งั้นใช้ผล OCR ที่เสร็จแล้ว (ไม่รอ)
+            const suggested = data.productName || ocrResult.get(interaction.channel.id) || null;
+            ocrResult.delete(interaction.channel.id);
+
+            const input = new TextInputBuilder().setCustomId('product_name')
+                .setLabel(suggested ? 'ชื่อสินค้า (อ่านจากรูปให้แล้ว แก้ได้)' : 'ชื่อสินค้า')
+                .setStyle(TextInputStyle.Short).setPlaceholder('เช่น กากสุด').setMaxLength(100).setRequired(true);
+            if (suggested) input.setValue(String(suggested).slice(0, 100));
+
+            const modal = new ModalBuilder().setCustomId(`close_info_${type}`).setTitle('📦 ข้อมูลสินค้า')
+                .addComponents(new ActionRowBuilder().addComponents(input));
             return interaction.showModal(modal);
         }
 
-        // ── กรอกข้อมูลแล้ว → นับแต้ม สุ่มรางวัล ปิดห้อง (ปิดกี่รอบก็ได้ ระบบนับเวลาใหม่ทุกรอบ) ──
+        // ── กรอกข้อมูลแล้ว → ให้แต้ม (ถ้า error จะไม่ให้แต้มเลย) ──
         if (interaction.isModalSubmit() && interaction.customId.startsWith('close_info_')) {
             const type = interaction.customId.slice('close_info_'.length);
             const data = activeTicketData[interaction.channel.id];
             if (!data) return interaction.reply({ content: '❌ ไม่พบข้อมูลตั๋วนี้', ephemeral: true });
+            const productName = interaction.fields.getTextInputValue('product_name').trim();
+            await interaction.deferReply();   // ตอบก่อน 3 วินาที
 
-            const price = Number(data.price) || 0;   // ยอดจาก QR ที่สร้างในห้องนี้
-            data.productType  = type;
-            data.productName  = interaction.fields.getTextInputValue('product_name').trim();
-            data.amount       = price;
-            data.orderNo      = newOrderNo(type);
-            data.pointsEarned = price * POINTS_PER_ITEM;
-            data.rewards      = [];
-
-            if (data.userId) {
-                const rec = (pointsData[data.userId] ??= { points: 0, totalSpent: 0, history: [] });
-                rec.totalSpent = (rec.totalSpent || 0) + price;
-                rec.points     += data.pointsEarned;
-                data.pointsBalance = rec.points;
-                (rec.history ??= []).push({
-                    ts: Date.now(), orderNo: data.orderNo, product: type, productName: data.productName,
-                    amount: price, points: data.pointsEarned, rewards: [], balance: rec.points, undone: false
-                });
-                if (rec.history.length > 200) rec.history.shift();
-                savePoints();
-                saveRewards();
+            let result;
+            try {
+                result = await commitClose(interaction.channel, data, { type, productName });
+            } catch (err) {
+                console.error('❌ ปิดห้องไม่สำเร็จ:', err);
+                return interaction.editReply({ content: '❌ ปิดห้องไม่สำเร็จ **ยังไม่มีการให้แต้ม** กรุณากดปิดห้องใหม่อีกครั้ง' });
             }
 
-            await finishTicket(interaction.channel, data);
-
-            const rewardText = data.rewards.length
-                ? `\n\n🎉 ได้รับรางวัลสะสมแต้ม: **${data.rewards.map(r => PRODUCT_LABEL[r]).join(', ')}**\nแคปหน้าจอข้อความนี้ไว้ แล้วเปิดตั๋วใหม่เพื่อรับรางวัลกับแอดมินได้เลยนะคะ`
-                : '';
             const embed = new EmbedBuilder()
                 .setColor('#2ECC71').setTitle('✅ ปิดห้องแล้ว')
-                .setDescription(`ห้องนี้ถูกปิดแล้วครับ ระบบจะลบห้องภายใน 1 วัน (ถ้ามีการปิดอีกจะนับเวลาใหม่)\n\n${data.pointsEarned ? `⭐ ได้รับ ${data.pointsEarned} แต้ม (คงเหลือ ${data.pointsBalance ?? 0} แต้ม)` : '⚠️ ไม่พบยอดจาก QR จึงไม่ได้แต้ม'}${rewardText}\n\n💖 ขอบคุณที่ใช้บริการครับ ฝากรีวิวได้ที่ <#${REVIEW_CHANNEL_ID}>`);
-
-            await interaction.reply({ embeds: [embed] });
+                .setDescription(`ห้องนี้ถูกปิดแล้วครับ ระบบจะลบห้องภายใน 1 วัน (ถ้ามีการปิดอีกจะนับเวลาใหม่)\n\n` +
+                    (result.pts ? `⭐ ได้รับ ${result.pts} แต้ม (คงเหลือ ${result.balance} แต้ม)` : '⚠️ ไม่ได้แต้ม (ไม่พบยอดจาก QR หรือไม่มีตัวตนลูกค้า)') +
+                    (result.reclosed ? '\n♻️ ปิดซ้ำ: คืนแต้มเดิมและคำนวณใหม่แล้ว' : '') +
+                    `\n\n💖 ขอบคุณที่ใช้บริการครับ ฝากรีวิวได้ที่ <#${REVIEW_CHANNEL_ID}>`);
+            await interaction.editReply({ embeds: [embed] });
             interaction.channel.setName(`✅-${data.qNum}`).catch(() => {});
             return;
         }
@@ -931,4 +1088,89 @@ client.on('interactionCreate', async (interaction) => {
 // [ 8. Login ]
 // ==========================================
 // ⚠️ ห้ามเขียนโทเคนตรงๆ ในโค้ด — ใส่ไว้ในไฟล์ .env เป็น TOKEN=your_token_here
+// ══════════════════════════════════════════════════════════
+//  เช็คเรทกรอบรูป (Comet New) — ห้องเช็คเรทเท่านั้น
+// ══════════════════════════════════════════════════════════
+const RATE_CHECK_CHANNEL_ID = '1574745487490285699';
+const RATE_SHOP_NAME        = 'Comet New';
+
+// ราคา Discord (ไม่มี Nitro) → ราคาร้านรับกด  (ประกาศ 2026-11-06)
+const FRAME_RATES = {
+    single: { 209: 45, 250: 55, 295: 80, 339: 90, 359: 95, 380: 110, 425: 120, 440: 130, 459: 160, 475: 170, 539: 200 },
+    2:      { 380: 100, 440: 130, 475: 140, 490: 150, 510: 160, 539: 170, 560: 180, 589: 220, 639: 260, 689: 270, 739: 285, 860: 345 },
+    3:      { 475: 115, 539: 130, 589: 200, 660: 220, 710: 255, 739: 260, 789: 310, 860: 375, 1010: 475 },
+    4:      { 560: 150, 660: 170 },
+    5:      {}   // ยังไม่มีเรทบันเดิล 5 ในประกาศล่าสุด
+};
+
+/** อ่านชื่อ จำนวนชิ้น และราคา Discord (ไม่มี Nitro) จากข้อความ OCR ของการ์ดสินค้า */
+function parseRateCard(text) {
+    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+    const idx = lines.findIndex(l => l.includes('ประเภท'));
+    const name = idx > 0 ? lines[idx - 1].slice(0, 100) : null;
+
+    const bundle = text.match(/ประกอบไปด้วย\s*(\d)\s*รายการ/);
+    const qty = bundle ? parseInt(bundle[1], 10) : 1;
+
+    const priceM = text.match(/ไม่มี\s*Nitro\s*[:;.]?\s*([\d,]+(?:\.\d{1,2})?)/i);
+    const price  = priceM ? Math.round(parseFloat(priceM[1].replace(/,/g, ''))) : null;
+
+    return { name, qty, price };
+}
+
+/** ค้นเรทตามจำนวนชิ้นและราคา (ตรงตัวเลขเท่านั้น) */
+function lookupFrameRate(qty, price) {
+    const table = FRAME_RATES[qty === 1 ? 'single' : String(qty)];
+    if (!table || !Object.keys(table).length) return { status: 'no_rate' };
+    const rate = table[price];
+    return rate == null ? { status: 'not_found' } : { status: 'ok', rate };
+}
+
+async function handleRateCheck(message) {
+    const images = [...message.attachments.values()].filter(a => OCR_MIME.includes(a.contentType?.split(';')[0]));
+    if (!images.length) return;
+    const worker = await getOcrWorker();
+
+    for (const a of images) {
+        const r = await fetch(a.url, { signal: AbortSignal.timeout(8000) }).catch(() => null);
+        if (!r?.ok) { await message.reply({ content: '⚠️ โหลดรูปไม่สำเร็จ กรุณาส่งใหม่อีกครั้ง', allowedMentions: { repliedUser: false } }); continue; }
+        const { data } = await worker.recognize(Buffer.from(await r.arrayBuffer()));
+        const { name, qty, price } = parseRateCard(data?.text ?? '');
+        const title = `(จำนวน ${images.length} รูป)`;
+
+        if (!name || price == null) {
+            await message.reply({
+                content: `⚠️ อ่านรูปนี้ไม่ครบ (ชื่อหรือราคาอ่านไม่ได้) <@&${ADMIN_ROLE_ID}> ช่วยตรวจราคาให้หน่อยครับ`,
+                allowedMentions: { roles: [ADMIN_ROLE_ID], repliedUser: false }
+            });
+            continue;
+        }
+
+        const res = lookupFrameRate(qty, price);
+        if (res.status === 'no_rate') {
+            await message.reply({ content: `ยังไม่มีเรทสำหรับ **บันเดิล ${qty}** ของ ${RATE_SHOP_NAME} ครับ`, allowedMentions: { repliedUser: false } });
+            continue;
+        }
+        if (res.status === 'not_found') {
+            await message.reply({
+                content: `⚠️ ไม่พบราคา ${price} บาท ในเรทของ ${RATE_SHOP_NAME} กรุณาแอดมินตรวจ <@&${ADMIN_ROLE_ID}>`,
+                allowedMentions: { roles: [ADMIN_ROLE_ID], repliedUser: false }
+            });
+            continue;
+        }
+
+        const embed = new EmbedBuilder()
+            .setColor('#E74C3C')
+            .setTitle(`✅ ตรวจสอบราคาสินค้า ${title}`)
+            .addFields(
+                { name: 'ชื่อสินค้า', value: name, inline: false },
+                { name: 'ประเภท', value: qty === 1 ? 'ชิ้นเดียว' : `บันเดิล ${qty}`, inline: true },
+                { name: 'ราคา Discord (ไม่มี Nitro)', value: `${price.toFixed(2)} บาท`, inline: false },
+                { name: `ราคาร้านรับกด (${RATE_SHOP_NAME})`, value: `${res.rate.toFixed(2)} บาท`, inline: false }
+            )
+            .setFooter({ text: RATE_SHOP_NAME });
+        await message.reply({ embeds: [embed], allowedMentions: { repliedUser: false } });
+    }
+}
+
 client.login(process.env.DISCORDTOKEN || process.env.TOKEN);
