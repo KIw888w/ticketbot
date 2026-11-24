@@ -215,34 +215,43 @@ function rollSpin() {
     return SPIN_TABLE[SPIN_TABLE.length - 1];
 }
 
-/** ชื่อสินค้าที่อ่านจากรูปได้แล้ว: channelId -> string|null (เติมเมื่อ OCR เสร็จ) */
+/** ชื่อสินค้าที่อ่านจากรูปได้แล้ว: channelId -> string|null (เติมเมื่ออ่านเสร็จ) */
 const ocrResult = new Map();
 
-let ocrWorkerPromise = null;
-/** สร้าง worker ของ Tesseract ครั้งเดียว (ครั้งแรกจะดาวน์โหลดข้อมูลภาษาไทยก่อน) */
-function getOcrWorker() {
-    if (!ocrWorkerPromise) {
-        const { createWorker } = require('tesseract.js');
-        ocrWorkerPromise = createWorker('tha+eng').catch(err => { ocrWorkerPromise = null; throw err; });
-    }
-    return ocrWorkerPromise;
+const OCR_MIME = ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'];   // รูปแบบที่ Gemini รับ
+const GEMINI_MODEL = 'gemini-2.5-flash';   // ถ้า Google เปลี่ยนชื่อโมเดล แก้ตรงนี้
+
+/** ส่งรูป + คำสั่งไปให้ Gemini แล้วได้ JSON กลับมา (ต้องตั้งค่า GEMINI_API_KEY ในโฮสต์) */
+async function askGemini(parts) {
+    const key = process.env.GEMINI_API_KEY;
+    if (!key) throw new Error('ยังไม่ได้ตั้งค่า GEMINI_API_KEY');
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-goog-api-key': key },
+        body: JSON.stringify({
+            contents: [{ parts }],
+            generationConfig: { responseMimeType: 'application/json', temperature: 0 }
+        }),
+        signal: AbortSignal.timeout(20000)
+    });
+    if (!res.ok) throw new Error(`Gemini API ตอบ ${res.status}`);
+    const json = await res.json();
+    const text = (json.candidates?.[0]?.content?.parts ?? []).map(p => p.text ?? '').join('').trim();
+    if (!text) throw new Error('Gemini ไม่ได้ส่งผลลัพธ์กลับมา');
+    return JSON.parse(text.replace(/```json|```/g, '').trim());
 }
 
-const OCR_MIME = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp'];
-// บรรทัดที่น่าจะเป็นข้อความสลิป/การเงิน ไม่ใช่ชื่อสินค้า
-const OCR_SKIP = /(โอน|บาท|สลิป|slip|promptpay|พร้อมเพย์|ref|เลขที่|รายการ|จำนวน|ธนาคาร|วันที่|เวลา|\d{1,2}:\d{2}|\d{6,})/i;
-
-/** เลือกบรรทัดที่น่าจะเป็นชื่อสินค้า (เอาบรรทัดที่มีตัวอักษรมากสุดหลังกรองสลิปออก) */
-function pickProductLine(text) {
-    const lines = text.split('\n')
-        .map(l => l.replace(/[|=_~•·“”"'`]+/g, ' ').replace(/\s+/g, ' ').trim())
-        .filter(l => l.length >= 3 && /[\u0E00-\u0E7Fa-zA-Z]/.test(l) && !OCR_SKIP.test(l));
-    if (!lines.length) return null;
-    lines.sort((x, y) => y.replace(/[^\u0E00-\u0E7Fa-zA-Z]/g, '').length - x.replace(/[^\u0E00-\u0E7Fa-zA-Z]/g, '').length);
-    return lines[0].slice(0, 100);
+/** แปลงไฟล์แนบของดิสคอร์ดเป็นชิ้นข้อมูลรูปสำหรับ Gemini */
+async function attachmentToPart(att) {
+    const r = await fetch(att.url, { signal: AbortSignal.timeout(8000) });
+    if (!r.ok) return null;
+    return { inline_data: {
+        mime_type: att.contentType.split(';')[0],
+        data: Buffer.from(await r.arrayBuffer()).toString('base64')
+    } };
 }
 
-/** อ่านรูปที่ลูกค้าส่งในห้องตั๋ว (สูงสุด 3 รูปล่าสุด) ด้วย Tesseract ในเครื่อง — ไม่มีรูป/อ่านไม่ได้ → null */
+/** อ่านชื่อสินค้าจากรูปที่ลูกค้าส่งในห้องตั๋ว (สูงสุด 3 รูปล่าสุด) — ไม่มีรูป → null */
 async function readProductNameFromTicket(channel, ownerId) {
     if (!ownerId) return null;
     const msgs = await channel.messages.fetch({ limit: 50 });
@@ -256,15 +265,14 @@ async function readProductNameFromTicket(channel, ownerId) {
     }
     if (!images.length) return null;
 
-    const worker = await getOcrWorker();
-    let text = '';
-    for (const a of images) {
-        const r = await fetch(a.url, { signal: AbortSignal.timeout(8000) });
-        if (!r.ok) continue;
-        const { data } = await worker.recognize(Buffer.from(await r.arrayBuffer()));
-        text += '\n' + (data?.text ?? '');
-    }
-    return pickProductLine(text);
+    const parts = [];
+    for (const a of images) { const p = await attachmentToPart(a); if (p) parts.push(p); }
+    if (!parts.length) return null;
+    parts.push({ text: 'ภาพเหล่านี้เป็นภาพที่ลูกค้าส่งเพื่อสั่งซื้อสินค้า ให้อ่านชื่อสินค้าที่ลูกค้าต้องการซื้อ (ตามตัวอักษรที่เห็นจริง) ' +
+        'ถ้าเป็นสลิปโอนเงินหรือภาพที่ไม่มีชื่อสินค้า ให้ข้ามไป ตอบเป็น JSON รูปแบบ {"product_name": "ชื่อสินค้า"} หรือ {"product_name": null} ถ้าอ่านไม่ได้' });
+    const out = await askGemini(parts);
+    const name = typeof out.product_name === 'string' ? out.product_name.trim() : '';
+    return name ? name.slice(0, 100) : null;
 }
 
 function pointsRecord(userId) { return (pointsData[userId] ??= { points: 0, totalSpent: 0, history: [] }); }
@@ -1103,18 +1111,18 @@ const FRAME_RATES = {
     5:      {}   // ยังไม่มีเรทบันเดิล 5 ในประกาศล่าสุด
 };
 
-/** อ่านชื่อ จำนวนชิ้น และราคา Discord (ไม่มี Nitro) จากข้อความ OCR ของการ์ดสินค้า */
-function parseRateCard(text) {
-    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-    const idx = lines.findIndex(l => l.includes('ประเภท'));
-    const name = idx > 0 ? lines[idx - 1].slice(0, 100) : null;
-
-    const bundle = text.match(/ประกอบไปด้วย\s*(\d)\s*รายการ/);
-    const qty = bundle ? parseInt(bundle[1], 10) : 1;
-
-    const priceM = text.match(/ไม่มี\s*Nitro\s*[:;.]?\s*([\d,]+(?:\.\d{1,2})?)/i);
-    const price  = priceM ? Math.round(parseFloat(priceM[1].replace(/,/g, ''))) : null;
-
+/** ให้ Gemini อ่านการ์ดสินค้าจากรูป → { name, qty, price } (ราคา Discord ไม่มี Nitro) */
+async function readRateCard(attachment) {
+    const part = await attachmentToPart(attachment);
+    if (!part) return { name: null, qty: 1, price: null };
+    const out = await askGemini([part, { text:
+        'ภาพนี้เป็นการ์ดสินค้าจากร้านค้าดิสคอร์ด ให้อ่าน 3 อย่างแล้วตอบเป็น JSON อย่างเดียว ' +
+        '{"name": "ชื่อสินค้า (ตามบรรทัดชื่อบันเดิลหรือชื่อสินค้า)", "qty": จำนวนชิ้นในบันเดิล (ตัวเลข 1 ถ้าเป็นชิ้นเดียว), ' +
+        '"price": ราคาในบรรทัด "ไม่มี Nitro" เป็นตัวเลขไม่มีคอมมา เช่น 589} ' +
+        'ถ้าอ่านค่าไหนไม่ได้ให้ใส่ null' }]);
+    const qty   = Number.isInteger(out.qty) ? out.qty : 1;
+    const price = typeof out.price === 'number' ? Math.round(out.price) : null;
+    const name  = typeof out.name === 'string' && out.name.trim() ? out.name.trim().slice(0, 100) : null;
     return { name, qty, price };
 }
 
@@ -1129,13 +1137,20 @@ function lookupFrameRate(qty, price) {
 async function handleRateCheck(message) {
     const images = [...message.attachments.values()].filter(a => OCR_MIME.includes(a.contentType?.split(';')[0]));
     if (!images.length) return;
-    const worker = await getOcrWorker();
 
     for (const a of images) {
-        const r = await fetch(a.url, { signal: AbortSignal.timeout(8000) }).catch(() => null);
-        if (!r?.ok) { await message.reply({ content: '⚠️ โหลดรูปไม่สำเร็จ กรุณาส่งใหม่อีกครั้ง', allowedMentions: { repliedUser: false } }); continue; }
-        const { data } = await worker.recognize(Buffer.from(await r.arrayBuffer()));
-        const { name, qty, price } = parseRateCard(data?.text ?? '');
+        let card;
+        try {
+            card = await readRateCard(a);
+        } catch (err) {
+            console.error('❌ อ่านการ์ดด้วย Gemini ไม่สำเร็จ:', err.message);
+            await message.reply({
+                content: `⚠️ อ่านรูปนี้ตอนนี้ไม่ได้ (${err.message}) <@&${ADMIN_ROLE_ID}> ช่วยตรวจราคาให้หน่อยครับ`,
+                allowedMentions: { roles: [ADMIN_ROLE_ID], repliedUser: false }
+            });
+            continue;
+        }
+        const { name, qty, price } = card;
         const title = `(จำนวน ${images.length} รูป)`;
 
         if (!name || price == null) {
