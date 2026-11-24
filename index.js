@@ -261,6 +261,54 @@ async function askGemini(parts) {
     throw new Error(lastErr);
 }
 
+/** Groq (แยกโควตาจาก Google — ฟรี ไม่ต้องใช้บัตร) ใช้รูปแบบ OpenAI-compatible */
+const GROQ_MODEL = process.env.GROQ_MODEL || 'qwen/qwen3.6-27b';   // ถ้า Groq เลิกใช้โมเดลนี้ ตั้ง GROQ_MODEL ใหม่ได้
+async function askGroq(parts) {
+    const key = process.env.GROQ_API_KEY;
+    if (!key) throw new Error('ยังไม่ได้ตั้งค่า GROQ_API_KEY');
+    const content = parts.map(p => p.inline_data
+        ? { type: 'image_url', image_url: { url: `data:${p.inline_data.mime_type};base64,${p.inline_data.data}` } }
+        : { type: 'text', text: p.text });
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
+        body: JSON.stringify({ model: GROQ_MODEL, messages: [{ role: 'user', content }],
+            response_format: { type: 'json_object' }, temperature: 0 }),
+        signal: AbortSignal.timeout(20000)
+    });
+    if (!res.ok) {
+        const body = (await res.text().catch(() => '')).slice(0, 200);
+        throw new Error(`Groq ตอบ ${res.status}: ${body}`);
+    }
+    const json = await res.json();
+    const text = (json.choices?.[0]?.message?.content ?? '').replace(/```json|```/g, '').trim();
+    if (!text) throw new Error('Groq ไม่ได้ส่งผลลัพธ์กลับมา');
+    return JSON.parse(text);
+}
+
+/**
+ * อ่านรูปด้วยผู้ให้บริการสองเจ้า (เป็นอิสระต่อกัน ถ้าเจ้าหนึ่งล่มอีกเจ้าช่วยได้)
+ *  - ถ้ามี GROQ_API_KEY → ลอง Groq ก่อน แล้วค่อย Gemini
+ *  - ถ้าไม่มี → ใช้ Gemini อย่างเดียว
+ */
+async function askVision(parts) {
+    const providers = [];
+    if (process.env.GROQ_API_KEY) providers.push(['Groq', askGroq]);
+    if (process.env.GEMINI_API_KEY) providers.push(['Gemini', askGemini]);
+    if (!providers.length) throw new Error('ยังไม่ได้ตั้งค่า GROQ_API_KEY หรือ GEMINI_API_KEY');
+
+    let lastErr = null;
+    for (const [name, fn] of providers) {
+        try {
+            return await fn(parts);
+        } catch (err) {
+            console.error(`⚠️ ${name} อ่านรูปไม่สำเร็จ:`, err.message);
+            lastErr = err;
+        }
+    }
+    throw lastErr;
+}
+
 /** แปลงไฟล์แนบของดิสคอร์ดเป็นชิ้นข้อมูลรูปสำหรับ Gemini */
 async function attachmentToPart(att) {
     const r = await fetch(att.url, { signal: AbortSignal.timeout(8000) });
@@ -290,7 +338,7 @@ async function readProductNameFromTicket(channel, ownerId) {
     if (!parts.length) return null;
     parts.push({ text: 'ภาพเหล่านี้เป็นภาพที่ลูกค้าส่งเพื่อสั่งซื้อสินค้า ให้อ่านชื่อสินค้าที่ลูกค้าต้องการซื้อ (ตามตัวอักษรที่เห็นจริง) ' +
         'ถ้าเป็นสลิปโอนเงินหรือภาพที่ไม่มีชื่อสินค้า ให้ข้ามไป ตอบเป็น JSON รูปแบบ {"product_name": "ชื่อสินค้า"} หรือ {"product_name": null} ถ้าอ่านไม่ได้' });
-    const out = await askGemini(parts);
+    const out = await askVision(parts);
     const name = typeof out.product_name === 'string' ? out.product_name.trim() : '';
     return name ? name.slice(0, 100) : null;
 }
@@ -1135,7 +1183,7 @@ const FRAME_RATES = {
 async function readRateCard(attachment) {
     const part = await attachmentToPart(attachment);
     if (!part) return { name: null, qty: 1, price: null };
-    const out = await askGemini([part, { text:
+    const out = await askVision([part, { text:
         'ภาพนี้เป็นการ์ดสินค้าจากร้านค้าดิสคอร์ด ให้อ่าน 3 อย่างแล้วตอบเป็น JSON อย่างเดียว ' +
         '{"name": "ชื่อสินค้า (ตามบรรทัดชื่อบันเดิลหรือชื่อสินค้า)", "qty": จำนวนชิ้นในบันเดิล (ตัวเลข 1 ถ้าเป็นชิ้นเดียว), ' +
         '"price": ราคาในบรรทัด "ไม่มี Nitro" เป็นตัวเลขไม่มีคอมมา เช่น 589} ' +
