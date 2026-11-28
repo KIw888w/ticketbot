@@ -12,7 +12,7 @@ process.on('uncaughtException',  (err)    => { console.error('💥 Uncaught Exce
 const {
     Client, GatewayIntentBits, ActionRowBuilder, EmbedBuilder,
     PermissionFlagsBits, ButtonBuilder, ButtonStyle, Events,
-    ModalBuilder, TextInputBuilder, TextInputStyle, StringSelectMenuBuilder, AttachmentBuilder
+    ModalBuilder, TextInputBuilder, TextInputStyle, StringSelectMenuBuilder, AttachmentBuilder, SlashCommandBuilder, ChannelType
 } = require('discord.js');
 
 const BANNER_URL  = '';                      // ใส่ลิงก์รูปแบนเนอร์ตรงนี้ (เช่น https://...png)
@@ -361,15 +361,16 @@ function revokeAwardInMemory(data) {
 }
 
 /** ปรับแต้มด้วยมือ (!addcredit/!addpoints) — ถ้าเซฟไม่ได้จะคืนค่าเดิม */
-function applyManualPoints(userId, n, byUserId) {
+function applyManualPoints(userId, n, byUserId, reason = '') {
     const backup = JSON.stringify(pointsData);
     const rec = pointsRecord(userId);
     const before = rec.points ?? 0;
     if (before + n < 0) return { ok: false, before, after: before };
     try {
-        rec.points = before + n;
+        rec.points     = before + n;
+        rec.totalSpent = Math.max(0, (rec.totalSpent || 0) + n);   // 1 แต้ม = 1 บาท → นับเข้าอันดับลูกค้าด้วย
         pushHistory(rec, { ts: Date.now(), orderNo: `ADJ-${Date.now().toString(36).toUpperCase()}`, product: 'adjust',
-            productName: 'ปรับแต้มด้วยมือ', amount: 0, points: n, rewards: [], balance: rec.points, undone: false, by: byUserId });
+            productName: reason ? `ปรับแต้มด้วยมือ (${reason})` : 'ปรับแต้มด้วยมือ', amount: n, points: n, rewards: [], balance: rec.points, undone: false, by: byUserId });
         savePoints();
         return { ok: true, before, after: rec.points };
     } catch (err) {
@@ -580,6 +581,7 @@ const client = new Client({
 
 client.once(Events.ClientReady, async () => {
     console.log(`✅ ล็อกอินแล้ว: ${client.user.tag}`);
+    await registerSlashCommands();
 
     // กู้ตัวจับเวลาปิดตั๋วที่ค้างอยู่ (เผื่อบอทรีสตาร์ทระหว่างรอ 10 นาที)
     for (const [channelId, data] of Object.entries(activeTicketData)) {
@@ -617,18 +619,18 @@ client.once(Events.ClientReady, async () => {
 });
 
 // ==========================================
-// [ 7. Message Handler: คำสั่งแอดมิน + นับรีวิว ]
+// [ 7. Message Handler: นับรีวิว + เช็คเรทจากรูป ]
 // ==========================================
 client.on('messageCreate', async (message) => {
     if (!message.guild || message.author.bot) return;
 
-    // ── ห้องเช็คเรทกรอบรูป: รูปที่ไม่ได้ขึ้นต้นด้วย ! → อ่านราคาแล้วตอบกลับ ──
-    if (message.channel.id === RATE_CHECK_CHANNEL_ID && message.attachments.size && !message.content.startsWith('!')) {
+    // ── ห้องเช็คเรทกรอบรูป: ส่งรูป → อ่านราคาแล้วตอบกลับ ──
+    if (message.channel.id === RATE_CHECK_CHANNEL_ID && message.attachments.size) {
         handleRateCheck(message).catch(err => console.error('❌ เช็คเรทไม่สำเร็จ:', err));
         return;
     }
 
-    // ── ระบบนับรีวิว (เช็คก่อนคำสั่ง เพื่อให้รีวิวที่ขึ้นต้นด้วย ! ก็นับ) ──
+    // ── ระบบนับรีวิว ──
     if (message.channel.id === REVIEW_CHANNEL_ID) {
         if (message.member?.roles.cache.has(ADMIN_ROLE_ID)) {
             console.log('ℹ️ ข้อความของแอดมินในห้องรีวิว — ไม่นับ');
@@ -650,33 +652,107 @@ client.on('messageCreate', async (message) => {
             return;
         }
     }
+    // (คำสั่งแอดมินทั้งหมดย้ายไปเป็น slash command แล้ว — ดู handleSlash)
+});
 
-    // ── คำสั่งแอดมิน (เช็คก่อนเสมอ แม้จะพิมพ์ในห้องตั๋วก็ใช้ได้) ──────
-    if (message.content.startsWith('!')) {
-        const args    = message.content.trim().split(/ +/);
-        const command = args[0].toLowerCase();
+// ════════════════════════════════════════════════════════════
+//  TICKET FLOW
+//
+//  create_ticket → สร้างห้องตั๋วทันที ไม่ถามอะไรเลย
+//  แอดมินใช้ /qr เพื่อแจ้งยอด+สร้าง QR เมื่อไหร่ก็ได้ ห้องไหนก็ได้
+//  ADMIN: btn_work (รับงาน)  |  btn_done (ปิดห้อง — แอดมินหรือเจ้าของตั๋วกดได้)
+// ════════════════════════════════════════════════════════════
 
-        const ADMIN_COMMANDS = ['!setupshop', '!qr', '!points', '!addpoints', '!addcredit', '!rewards', '!pointlog', '!undo', '!topbuyer', '!setstock', '!stock', '!randompanel', '!shoppanel', '!rate', '!ratepanel'];
-        if (!ADMIN_COMMANDS.includes(command)) return;
+// ════════════════════════════════════════════════════════════
+//  SLASH COMMANDS (แทนคำสั่ง ! เดิมทั้งหมด)
+//  ทุกคำสั่งใช้ได้เฉพาะคนที่มี ADMIN_ROLE_ID
+// ════════════════════════════════════════════════════════════
+const SLASH_COMMANDS = [
+    new SlashCommandBuilder().setName('rate').setDescription('จัดการเรทราคากรอบรูป')
+        .addSubcommand(s => s.setName('list').setDescription('ดูเรททั้งหมด'))
+        .addSubcommand(s => s.setName('add').setDescription('เพิ่มเรท (ถ้ามีชื่อนี้อยู่แล้วจะแก้ราคาให้)')
+            .addStringOption(o => o.setName('name').setDescription('ชื่อสินค้า').setRequired(true).setMaxLength(100))
+            .addIntegerOption(o => o.setName('discord_price').setDescription('ราคา Discord').setRequired(true).setMinValue(1))
+            .addNumberOption(o => o.setName('shop_price').setDescription('ราคาร้านขาย').setRequired(true).setMinValue(0)))
+        .addSubcommand(s => s.setName('del').setDescription('ลบเรท')
+            .addStringOption(o => o.setName('name').setDescription('ชื่อสินค้าที่จะลบ').setRequired(true).setMaxLength(100))),
 
-        // แจ้งเตือนชัดเจนแทนการเงียบ เผื่อ role ไม่ตรง จะได้รู้ทันทีว่าปัญหาคืออะไร
-        if (!message.member || !message.member.roles.cache.has(ADMIN_ROLE_ID)) {
-            return message.reply(`❌ คุณไม่มีสิทธิ์ใช้คำสั่งนี้ครับ (ต้องมี role ไอดี \`${ADMIN_ROLE_ID}\`)`);
+    new SlashCommandBuilder().setName('ratepanel').setDescription('โพสต์พาเนลจัดการเรทในห้องนี้'),
+    new SlashCommandBuilder().setName('setupshop').setDescription('โพสต์ปุ่มเปิดตั๋วในห้องนี้'),
+
+    new SlashCommandBuilder().setName('qr').setDescription('สร้าง QR พร้อมเพย์ตามยอดที่ระบุ')
+        .addNumberOption(o => o.setName('amount').setDescription('ยอดเงิน (บาท)').setRequired(true).setMinValue(0.01))
+        .addChannelOption(o => o.setName('channel').setDescription('ห้องปลายทาง (ไม่ใส่ = ห้องนี้)').addChannelTypes(ChannelType.GuildText)),
+
+    new SlashCommandBuilder().setName('randompanel').setDescription('วางปุ่มสุ่มรางวัลในห้องนี้'),
+    new SlashCommandBuilder().setName('shoppanel').setDescription('วางปุ่มร้านแลกของรางวัลในห้องนี้'),
+    new SlashCommandBuilder().setName('stock').setDescription('ดูสต็อกร้านแลกของรางวัล'),
+
+    new SlashCommandBuilder().setName('setstock').setDescription('ตั้งสต็อกร้านแลกของรางวัล')
+        .addIntegerOption(o => o.setName('item').setDescription('สินค้า').setRequired(true)
+            .addChoices(...SHOP_ITEMS.map((it, i) => ({ name: `${i + 1}. ${it.label}`, value: i }))))
+        .addIntegerOption(o => o.setName('amount').setDescription('จำนวนสต็อก').setRequired(true).setMinValue(0)),
+
+    new SlashCommandBuilder().setName('rewards').setDescription('ดูรายการรางวัลที่รอส่ง'),
+
+    new SlashCommandBuilder().setName('pointlog').setDescription('ดูประวัติแต้มล่าสุด 10 รายการของลูกค้า')
+        .addUserOption(o => o.setName('user').setDescription('ลูกค้า').setRequired(true)),
+
+    new SlashCommandBuilder().setName('undo').setDescription('หักแต้มย้อนหลังตามเลขออเดอร์')
+        .addStringOption(o => o.setName('order_no').setDescription('เลขออเดอร์').setRequired(true))
+        .addBooleanOption(o => o.setName('force').setDescription('ฝืนหักแม้มีรางวัลที่ส่งไปแล้ว')),
+
+    new SlashCommandBuilder().setName('topbuyer').setDescription('วางอันดับลูกค้าแบบเรียลไทม์ในห้องนี้ (แทนของเดิม)'),
+
+    new SlashCommandBuilder().setName('points').setDescription('ดูแต้มของลูกค้า')
+        .addUserOption(o => o.setName('user').setDescription('ลูกค้า').setRequired(true)),
+
+    new SlashCommandBuilder().setName('addpoints').setDescription('บวกแต้มให้ลูกค้า')
+        .addUserOption(o => o.setName('user').setDescription('ลูกค้า').setRequired(true))
+        .addIntegerOption(o => o.setName('amount').setDescription('จำนวนแต้มที่จะบวก').setRequired(true).setMinValue(1))
+        .addStringOption(o => o.setName('reason').setDescription('เหตุผล (ไม่ใส่ก็ได้)').setMaxLength(100)),
+
+    new SlashCommandBuilder().setName('removepoints').setDescription('ลบ/หักแต้มลูกค้า')
+        .addUserOption(o => o.setName('user').setDescription('ลูกค้า').setRequired(true))
+        .addIntegerOption(o => o.setName('amount').setDescription('จำนวนแต้มที่จะหัก').setRequired(true).setMinValue(1))
+        .addStringOption(o => o.setName('reason').setDescription('เหตุผล (ไม่ใส่ก็ได้)').setMaxLength(100))
+];
+
+/** ลงทะเบียนคำสั่ง / ให้ทุกเซิร์ฟเวอร์ที่บอทอยู่ (แบบ guild → ขึ้นทันที ไม่ต้องรอ) */
+async function registerSlashCommands() {
+    const body = SLASH_COMMANDS.map(c => c.toJSON());
+    for (const guild of client.guilds.cache.values()) {
+        try {
+            await guild.commands.set(body);
+            console.log(`✅ ลงทะเบียนคำสั่ง / ${body.length} คำสั่งในเซิร์ฟเวอร์ ${guild.name}`);
+        } catch (err) {
+            console.error(`❌ ลงทะเบียนคำสั่ง / ใน ${guild.name} ไม่สำเร็จ (บอทต้องถูกเชิญด้วย scope applications.commands):`, err.message);
         }
+    }
+}
 
-        // !rate list | !rate add ชื่อ | ราคาDiscord | ราคาร้าน | !rate del ชื่อ  (จัดการเรทจากดิสคอร์ด)
-        if (command === '!rate') {
-            const body = message.content.trim().slice('!rate'.length).trim();
-            const sub  = (body.split(/\s+/)[0] ?? '').toLowerCase();
-            const rest = body.slice(sub.length).trim();
+// คำสั่งที่เป็นการ "วางพาเนล" → ตอบเฉพาะคนสั่ง (คนอื่นเห็นแค่พาเนล)
+const SLASH_EPHEMERAL = new Set(['ratepanel', 'setupshop', 'randompanel', 'shoppanel', 'topbuyer']);
+
+async function handleSlash(interaction) {
+    const name = interaction.commandName;
+    if (!SLASH_COMMANDS.some(c => c.name === name)) return;
+
+    if (!interaction.inGuild())
+        return interaction.reply({ content: '❌ ใช้ได้เฉพาะในเซิร์ฟเวอร์ครับ', ephemeral: true });
+    if (!interaction.member?.roles?.cache?.has(ADMIN_ROLE_ID))
+        return interaction.reply({ content: `❌ คุณไม่มีสิทธิ์ใช้คำสั่งนี้ครับ (ต้องมี role ไอดี \`${ADMIN_ROLE_ID}\`)`, ephemeral: true });
+
+    await interaction.deferReply({ ephemeral: SLASH_EPHEMERAL.has(name) });
+    const reply  = (content) => interaction.editReply({ content, allowedMentions: { parse: [] } });
+    const replyE = (embed)   => interaction.editReply({ embeds: [embed], allowedMentions: { parse: [] } });
+
+    try {
+        // ── /rate list | add | del ──
+        if (name === 'rate') {
+            const sub   = interaction.options.getSubcommand();
             const rates = loadRates();
-            const reply = (content) => message.reply({ content, allowedMentions: { parse: [] } });
-            const save = (list) => { writeAtomic(RATES_FILE, JSON.stringify(list, null, 2)); };
-            const USAGE = '📘 วิธีใช้ `!rate`\n' +
-                '• `!rate list` — ดูเรททั้งหมด\n' +
-                '• `!rate add ชื่อสินค้า | ราคา Discord | ราคาร้านขาย` — เพิ่ม (ถ้ามีชื่อนี้อยู่แล้วจะแก้ราคาให้)\n' +
-                '• `!rate del ชื่อสินค้า` — ลบ\n' +
-                'ตัวอย่าง: `!rate add บันเดิล Venom | 739 | 270`';
+            const save  = (list) => { writeAtomic(RATES_FILE, JSON.stringify(list, null, 2)); };
 
             if (sub === 'list') {
                 if (!rates.length) return reply('ยังไม่มีเรทในระบบ');
@@ -685,43 +761,39 @@ client.on('messageCreate', async (message) => {
             }
 
             if (sub === 'add') {
-                const parts = rest.split('|').map(p => p.trim());
-                if (parts.length !== 3 || !parts[0]) return reply(USAGE);
-                const name = parts[0].slice(0, 100);
-                const discordPrice = Number(parts[1]);
-                const shopPrice = Number(parts[2]);
-                if (!Number.isInteger(discordPrice) || discordPrice <= 0 || !Number.isFinite(shopPrice) || shopPrice < 0)
-                    return reply('❌ ราคาต้องเป็นตัวเลข (ราคา Discord เป็นจำนวนเต็มมากกว่า 0)\n' + USAGE);
-                const key = name.toLowerCase();
-                const idx = rates.findIndex(r => String(r.name).toLowerCase() === key);
-                const entry = { name, discordPrice, shopPrice };
+                const rname        = interaction.options.getString('name', true).trim().slice(0, 100);
+                const discordPrice = interaction.options.getInteger('discord_price', true);
+                const shopPrice    = interaction.options.getNumber('shop_price', true);
+                if (!rname) return reply('❌ กรุณาใส่ชื่อสินค้า');
+                const key   = rname.toLowerCase();
+                const idx   = rates.findIndex(r => String(r.name).toLowerCase() === key);
+                const entry = { name: rname, discordPrice, shopPrice };
                 if (idx >= 0) rates[idx] = entry; else rates.push(entry);
                 try { save(rates); }
                 catch (err) { console.error('❌ บันทึกเรทไม่สำเร็จ:', err); return reply('❌ บันทึกเรทไม่สำเร็จ ลองใหม่อีกครั้ง'); }
-                return reply(`✅ ${idx >= 0 ? 'แก้' : 'เพิ่ม'}เรท **${name}** → Discord ${discordPrice} / ร้าน ${shopPrice}`);
+                return reply(`✅ ${idx >= 0 ? 'แก้' : 'เพิ่ม'}เรท **${rname}** → Discord ${discordPrice} / ร้าน ${shopPrice}`);
             }
 
             if (sub === 'del') {
-                if (!rest) return reply(USAGE);
-                const key = rest.toLowerCase();
-                const next = rates.filter(r => String(r.name).toLowerCase() !== key);
-                if (next.length === rates.length) return reply(`❌ ไม่พบ **${rest}** ในเรท`);
+                const rname = interaction.options.getString('name', true).trim();
+                const key   = rname.toLowerCase();
+                const next  = rates.filter(r => String(r.name).toLowerCase() !== key);
+                if (next.length === rates.length) return reply(`❌ ไม่พบ **${rname}** ในเรท`);
                 try { save(next); }
                 catch (err) { console.error('❌ บันทึกเรทไม่สำเร็จ:', err); return reply('❌ บันทึกเรทไม่สำเร็จ ลองใหม่อีกครั้ง'); }
-                return reply(`🗑️ ลบ **${rest}** แล้ว`);
+                return reply(`🗑️ ลบ **${rname}** แล้ว`);
             }
-
-            return reply(USAGE);
+            return;
         }
 
-        // !ratepanel → โพสต์พาเนลจัดการเรท (ข้อมูลยังอยู่แม้กดเข้าใหม่)
-        if (command === '!ratepanel') {
-            await message.channel.send({ ...buildRatePanel(), allowedMentions: { parse: [] } });
-            return message.delete().catch(() => {});
+        // ── /ratepanel ──
+        if (name === 'ratepanel') {
+            await interaction.channel.send({ ...buildRatePanel(), allowedMentions: { parse: [] } });
+            return reply('✅ วางพาเนลเรทแล้ว');
         }
 
-        // !setupshop → โพสต์ปุ่มเปิดตั๋ว
-        if (command === '!setupshop') {
+        // ── /setupshop ──
+        if (name === 'setupshop') {
             const embed = new EmbedBuilder()
                 .setAuthor({ name: '🛒 SHOP', iconURL: client.user.displayAvatarURL() })
                 .setTitle('🛍️ ยินดีต้อนรับสู่ร้านค้า')
@@ -734,40 +806,31 @@ client.on('messageCreate', async (message) => {
                 )
                 .setColor('#00B2FF')
                 .setFooter({ text: 'ระบบร้านค้าอัตโนมัติ' });
-
             const buttons = new ActionRowBuilder().addComponents(
                 new ButtonBuilder().setCustomId('create_ticket').setLabel('ᴄʀᴇᴀᴛᴇ ᴛɪᴄᴋᴇᴛ').setEmoji(BTN_EMOJI.contact).setStyle(ButtonStyle.Success)
             );
-
-            return message.channel.send({ embeds: [embed], components: [buttons] });
+            await interaction.channel.send({ embeds: [embed], components: [buttons] });
+            return reply('✅ วางปุ่มเปิดตั๋วแล้ว');
         }
 
-        // !qr [ยอดเงิน] [ห้องปลายทาง]  → สร้าง QR พร้อมเพย์ยอดที่ระบุ ส่งไปห้องไหนก็ได้
-        if (command === '!qr') {
-            const amount   = parseFloat(args[1]);
-            const targetId = resolveChannelId(args[2]);
+        // ── /qr amount [channel] ──
+        if (name === 'qr') {
+            const amount = interaction.options.getNumber('amount', true);
+            const picked = interaction.options.getChannel('channel') ?? interaction.channel;
+            const targetChannel = interaction.guild.channels.cache.get(picked.id);
+            if (!targetChannel) return reply('❌ ไม่พบห้องปลายทางนี้ในเซิร์ฟเวอร์ครับ');
 
-            if (isNaN(amount) || amount <= 0)
-                return message.reply('❌ รูปแบบไม่ถูกต้อง\nรูปแบบ: `!qr [ยอดเงิน] [ห้องปลายทาง]`\nห้องปลายทางใช้ mention ห้อง (#ชื่อห้อง), ไอดีห้อง, หรือลิงก์ห้องก็ได้\nตัวอย่าง: `!qr 150 #ticket-3`');
-
-            if (!targetId)
-                return message.reply('❌ ระบุห้องปลายทางไม่ถูกต้อง ใช้การ mention ห้อง (#ชื่อห้อง), ไอดีห้อง, หรือลิงก์ห้องก็ได้ครับ');
-
-            const targetChannel = message.guild.channels.cache.get(targetId);
-            if (!targetChannel)
-                return message.reply('❌ ไม่พบห้องปลายทางนี้ในเซิร์ฟเวอร์ครับ');
-
-            const existing = activeTicketData[targetId];
+            const existing = activeTicketData[targetChannel.id];
             let qNum = existing?.qNum;
             if (!qNum) { qNum = queueCount++; saveQueue(); }
 
-            activeTicketData[targetId] = {
-                category:     existing?.category ?? 'manual',
-                label:        existing?.label ?? 'ชำระเงิน',
-                price:        amount,
-                userId:       existing?.userId ?? null,
+            activeTicketData[targetChannel.id] = {
+                category:  existing?.category ?? 'manual',
+                label:     existing?.label ?? 'ชำระเงิน',
+                price:     amount,
+                userId:    existing?.userId ?? null,
                 qNum,
-                payMethod:    'promptpay'
+                payMethod: 'promptpay'
             };
             saveTickets();
 
@@ -784,146 +847,146 @@ client.on('messageCreate', async (message) => {
                 .setImage(buildQrUrl(amount))
                 .setFooter({ text: 'แอดมินจะตรวจสอบสลิปและดำเนินการให้ครับ' });
 
-            await targetChannel.send({ embeds: [qrEmbed] });
-            return message.reply(`✅ สร้าง QR ยอด **${amount.toLocaleString()} บาท** ส่งไปที่ ${targetChannel} แล้วครับ`);
+            try { await targetChannel.send({ embeds: [qrEmbed] }); }
+            catch (err) { console.error('❌ ส่ง QR ไม่สำเร็จ:', err); return reply(`❌ ส่ง QR ไปที่ ${targetChannel} ไม่ได้ (เช็คสิทธิ์บอทในห้องนั้น)`); }
+            return reply(`✅ สร้าง QR ยอด **${amount.toLocaleString()} บาท** ส่งไปที่ ${targetChannel} แล้วครับ`);
         }
 
-        // !randompanel → วางปุ่มหน้าสุ่มรางวัลในห้องนี้
-        if (command === '!randompanel') {
+        // ── /randompanel ──
+        if (name === 'randompanel') {
             const embed = new EmbedBuilder().setColor('#F1C40F').setTitle('🎲 ระบบสุ่มรางวัล')
                 .setDescription(`ใช้แต้มสะสมสุ่มรางวัลได้เลย (${REWARD_THRESHOLD} แต้ม/ครั้ง)\n\n🎲 **ของรางวัลที่สุ่มได้**\n${spinRewardText()}\n\nกดปุ่มด้านล่างเพื่อดูแต้มและสุ่มรางวัล`);
-            await message.channel.send({ ...bannerPayload(embed), components: [new ActionRowBuilder().addComponents(
+            await interaction.channel.send({ ...bannerPayload(embed), components: [new ActionRowBuilder().addComponents(
                 new ButtonBuilder().setCustomId('random_page').setLabel('สุ่มรางวัล').setEmoji('🎲').setStyle(ButtonStyle.Secondary)
             )] });
-            return;
+            return reply('✅ วางหน้าสุ่มรางวัลแล้ว');
         }
 
-        // !shoppanel → วางปุ่มร้านแลกของรางวัลในห้องนี้
-        if (command === '!shoppanel') {
+        // ── /shoppanel ──
+        if (name === 'shoppanel') {
             const embed = new EmbedBuilder().setColor('#5865F2').setTitle('💰 ร้านแลกของรางวัล')
                 .setDescription(`แลกแต้มสะสมเป็นของรางวัลได้เลย\n\n💰 **ของรางวัลที่แลกได้**\n${shopRewardText()}\n\nกดปุ่มด้านล่างเพื่อดูสินค้าและสต็อกคงเหลือ`);
-            await message.channel.send({ ...bannerPayload(embed), components: [new ActionRowBuilder().addComponents(
+            await interaction.channel.send({ ...bannerPayload(embed), components: [new ActionRowBuilder().addComponents(
                 new ButtonBuilder().setCustomId('shop').setLabel('แลกของรางวัล').setEmoji('💰').setStyle(ButtonStyle.Primary)
             )] });
-            return;
+            return reply('✅ วางหน้าร้านแลกของรางวัลแล้ว');
         }
 
-        // !stock → ดูสต็อกร้านแลกของรางวัล
-        if (command === '!stock') {
+        // ── /stock ──
+        if (name === 'stock') {
             const lines = SHOP_ITEMS.map((it, i) => `${i + 1}. ${it.label} — ${it.price} แต้ม · คงเหลือ **${shopData.stock[it.key] ?? 0}**`).join('\n');
-            return message.reply({ content: lines, allowedMentions: { parse: [] } });
+            return reply(lines);
         }
 
-        // !setstock <ลำดับ 1-3> <จำนวน> → ตั้งสต็อกเอง
-        if (command === '!setstock') {
-            const idx = parseInt(args[1], 10) - 1;
-            const n   = parseInt(args[2], 10);
-            const it  = SHOP_ITEMS[idx];
-            if (!it || !Number.isFinite(n) || n < 0)
-                return message.reply({ content: '❌ รูปแบบ: `!setstock <ลำดับ 1-3> <จำนวน>` (ดูลำดับจาก `!stock`)', allowedMentions: { parse: [] } });
+        // ── /setstock item amount ──
+        if (name === 'setstock') {
+            const it = SHOP_ITEMS[interaction.options.getInteger('item', true)];
+            const n  = interaction.options.getInteger('amount', true);
+            if (!it) return reply('❌ ไม่พบสินค้านี้');
             shopData.stock[it.key] = n;
             saveShop();
-            return message.reply({ content: `✅ ตั้งสต็อก **${it.label}** เป็น ${n} ชิ้นแล้ว`, allowedMentions: { parse: [] } });
+            return reply(`✅ ตั้งสต็อก **${it.label}** เป็น ${n} ชิ้นแล้ว`);
         }
 
-        // !rewards → รายการรางวัลที่รอส่ง
-        if (command === '!rewards') {
+        // ── /rewards ──
+        if (name === 'rewards') {
             const pending = rewardsData.filter(r => r.status === 'pending');
-            if (!pending.length) return message.reply({ content: '✅ ไม่มีรางวัลค้างส่ง', allowedMentions: { parse: [] } });
+            if (!pending.length) return reply('✅ ไม่มีรางวัลค้างส่ง');
             const lines = pending.map(r => `• \`#${r.id}\` <@${r.userId}> — ${PRODUCT_LABEL[r.type]} (ออเดอร์ \`${r.sourceOrderNo}\`)`).join('\n');
-            return message.reply({ embeds: [new EmbedBuilder().setColor('#E91E63').setTitle(`🎁 รางวัลค้างส่ง ${pending.length} รายการ`).setDescription(lines)], allowedMentions: { parse: [] } });
+            return replyE(new EmbedBuilder().setColor('#E91E63').setTitle(`🎁 รางวัลค้างส่ง ${pending.length} รายการ`).setDescription(lines));
         }
 
-        // !pointlog @ลูกค้า → ประวัติแต้มล่าสุด 10 รายการ
-        if (command === '!pointlog') {
-            const target = message.mentions.users.first();
-            if (!target) return message.reply({ content: '❌ รูปแบบ: `!pointlog @ลูกค้า`', allowedMentions: { parse: [] } });
+        // ── /pointlog user ──
+        if (name === 'pointlog') {
+            const target = interaction.options.getUser('user', true);
             const hist = (pointsData[target.id]?.history ?? []).slice(-10).reverse();
-            if (!hist.length) return message.reply({ content: 'ยังไม่มีประวัติแต้ม', allowedMentions: { parse: [] } });
+            if (!hist.length) return reply('ยังไม่มีประวัติแต้ม');
             const lines = hist.map(h => {
                 const when = new Date(h.ts).toLocaleString('th-TH', { timeZone: 'Asia/Bangkok', dateStyle: 'short', timeStyle: 'short' });
-                const pts  = h.undone ? `~~+${h.points}~~ ❌ ยกเลิกแล้ว` : `+${h.points} แต้ม`;
+                const sg   = (h.points > 0 ? '+' : '') + h.points;
+                const pts  = h.undone ? `~~${sg}~~ ❌ ยกเลิกแล้ว` : `${sg} แต้ม`;
                 const rw   = h.rewards?.length ? ` · 🎁 ${h.rewards.map(r => PRODUCT_LABEL[r]).join(', ')}` : '';
-                return `• ${when} · \`${h.orderNo}\` · ${PRODUCT_LABEL[h.product] ?? h.product} ${h.amount ?? 0} บาท · ${pts}${rw} · คงเหลือ ${h.balance}`;
+                return `• ${when} · \`${h.orderNo}\` · ${h.product === 'adjust' ? (h.productName ?? 'ปรับแต้มด้วยมือ') : `${PRODUCT_LABEL[h.product] ?? h.product} ${h.amount ?? 0} บาท`} · ${pts}${rw} · คงเหลือ ${h.balance}`;
             }).join('\n');
-            return message.reply({ embeds: [new EmbedBuilder().setColor('#F1C40F').setTitle(`📜 ประวัติแต้ม ${target.username}`).setDescription(lines)], allowedMentions: { parse: [] } });
+            return replyE(new EmbedBuilder().setColor('#F1C40F').setTitle(`📜 ประวัติแต้ม ${target.username}`).setDescription(lines));
         }
 
-        // !undo <เลขออเดอร์> [force] → หักแต้มย้อนหลัง
-        if (command === '!undo') {
-            const orderNo = args[1];
-            const force   = args[2]?.toLowerCase() === 'force';
-            if (!orderNo) return message.reply({ content: '❌ รูปแบบ: `!undo <เลขออเดอร์>`', allowedMentions: { parse: [] } });
+        // ── /undo order_no [force] ──
+        if (name === 'undo') {
+            const orderNo = interaction.options.getString('order_no', true).trim();
+            const force   = interaction.options.getBoolean('force') ?? false;
 
             let uid = null, entry = null;
             for (const [id, rec] of Object.entries(pointsData)) {
                 const h = (rec.history ?? []).find(x => x.orderNo === orderNo);
                 if (h) { uid = id; entry = h; break; }
             }
-            if (!entry) return message.reply({ content: `❌ ไม่พบออเดอร์ \`${orderNo}\``, allowedMentions: { parse: [] } });
-            if (entry.undone) return message.reply({ content: 'ออเดอร์นี้ถูกหักแต้มไปแล้ว', allowedMentions: { parse: [] } });
+            if (!entry) return reply(`❌ ไม่พบออเดอร์ \`${orderNo}\``);
+            if (entry.undone) return reply('ออเดอร์นี้ถูกหักแต้มไปแล้ว');
 
             const sent = rewardsData.filter(r => r.sourceOrderNo === orderNo && r.status === 'sent');
             if (sent.length && !force)
-                return message.reply({ content: `⚠️ ออเดอร์นี้มีรางวัลที่ส่งไปแล้ว ${sent.length} รายการ ถ้ายังจะหักแต้ม พิมพ์ \`!undo ${orderNo} force\``, allowedMentions: { parse: [] } });
+                return reply(`⚠️ ออเดอร์นี้มีรางวัลที่ส่งไปแล้ว ${sent.length} รายการ ถ้ายังจะหักแต้ม ให้ใช้ \`/undo order_no:${orderNo} force:True\``);
 
             const rec = pointsData[uid];
             rec.points     = Math.max(0, rec.points - entry.points);
             rec.totalSpent = Math.max(0, (rec.totalSpent || 0) - (entry.amount ?? 0));
-            entry.undone = true; entry.undoneAt = Date.now(); entry.undoneBy = message.author.id;
+            entry.undone = true; entry.undoneAt = Date.now(); entry.undoneBy = interaction.user.id;
             rewardsData.forEach(r => { if (r.sourceOrderNo === orderNo && r.status === 'pending') r.status = 'void'; });
             savePoints(); saveRewards();
             await updateLeaderboard();
-            return message.reply({ content: `↩️ ยกเลิกออเดอร์ \`${orderNo}\` แล้ว หัก ${entry.points} แต้มของ <@${uid}> คงเหลือ ${rec.points} แต้ม`, allowedMentions: { parse: [] } });
+            return reply(`↩️ ยกเลิกออเดอร์ \`${orderNo}\` แล้ว หัก ${entry.points} แต้มของ <@${uid}> คงเหลือ ${rec.points} แต้ม`);
         }
 
-        // !topbuyer → วางลีดเดอร์บอร์ดเรียลไทม์ในห้องนี้ (แทนของเดิม)
-        if (command === '!topbuyer') {
+        // ── /topbuyer ──
+        if (name === 'topbuyer') {
             if (leaderboardData.channelId && leaderboardData.messageId) {
                 const old = await client.channels.fetch(leaderboardData.channelId).then(c => c.messages.fetch(leaderboardData.messageId)).catch(() => null);
                 if (old) await old.delete().catch(() => {});
             }
-            const m = await message.channel.send({ embeds: [buildLeaderboardEmbed()], components: [buildLeaderboardRow()], allowedMentions: { parse: [] } });
-            leaderboardData = { channelId: message.channel.id, messageId: m.id };
+            const m = await interaction.channel.send({ embeds: [buildLeaderboardEmbed()], components: [buildLeaderboardRow()], allowedMentions: { parse: [] } });
+            leaderboardData = { channelId: interaction.channel.id, messageId: m.id };
             saveLeaderboard();
-            return;
+            return reply('✅ วางอันดับลูกค้าแล้ว (อัปเดตเรียลไทม์)');
         }
 
-        // !points @ลูกค้า → ดูแต้ม
-        if (command === '!points') {
-            const target = message.mentions.users.first();
-            if (!target) return message.reply('❌ รูปแบบ: `!points @ลูกค้า`');
+        // ── /points user ──
+        if (name === 'points') {
+            const target = interaction.options.getUser('user', true);
             const p = pointsData[target.id]?.points ?? 0;
-            return message.reply(`⭐ แต้มของ ${target} คือ **${p}** แต้ม (อีก ${Math.max(0, REWARD_THRESHOLD - p)} แต้มได้รางวัลสุ่ม)`);
+            return reply(`⭐ แต้มของ ${target} คือ **${p}** แต้ม (อีก ${Math.max(0, REWARD_THRESHOLD - p)} แต้มได้รางวัลสุ่ม)`);
         }
 
-        // !addpoints @ลูกค้า จำนวน → เพิ่ม/ลดแต้มด้วยมือ (ใส่ -2 เพื่อลด)
-        if (command === '!addpoints' || command === '!addcredit') {
-            const target = message.mentions.users.first();
-            const n      = parseInt(args[2], 10);
-            if (!target || !Number.isFinite(n)) return message.reply('❌ รูปแบบ: `!addpoints @ลูกค้า จำนวน` (ลดแต้มใส่เลขติดลบ เช่น -2)');
+        // ── /addpoints  |  /removepoints ──
+        if (name === 'addpoints' || name === 'removepoints') {
+            const isAdd  = name === 'addpoints';
+            const target = interaction.options.getUser('user', true);
+            const n      = interaction.options.getInteger('amount', true);
+            const reason = (interaction.options.getString('reason') ?? '').slice(0, 100);
+
             let r;
-            try { r = applyManualPoints(target.id, n, message.author.id); }
-            catch (err) { console.error('❌ ปรับแต้มไม่สำเร็จ:', err); return message.reply({ content: '❌ บันทึกแต้มไม่สำเร็จ ยังไม่มีการเปลี่ยนแต้ม ลองใหม่อีกครั้ง', allowedMentions: { parse: [] } }); }
-            if (!r.ok) return message.reply({ content: `❌ หักได้สูงสุด ${r.before} แต้ม (${target} มีอยู่ ${r.before} แต้ม)`, allowedMentions: { parse: [] } });
-            return message.reply({ content: `✅ ปรับแต้ม ${target} ${n > 0 ? '+' : ''}${n} → คงเหลือ **${r.after}** แต้ม`, allowedMentions: { parse: [] } });
+            try { r = applyManualPoints(target.id, isAdd ? n : -n, interaction.user.id, reason); }
+            catch (err) { console.error(`❌ ${isAdd ? 'บวก' : 'ลบ'}แต้มไม่สำเร็จ:`, err); return reply('❌ บันทึกแต้มไม่สำเร็จ ยังไม่มีการเปลี่ยนแต้ม ลองใหม่อีกครั้ง'); }
+            if (!r.ok) return reply(`❌ หักได้สูงสุด ${r.before} แต้ม (${target} มีอยู่ ${r.before} แต้ม)`);
+
+            await updateLeaderboard();
+            return replyE(new EmbedBuilder()
+                .setColor(isAdd ? '#2ECC71' : '#E74C3C')
+                .setTitle(isAdd ? '➕ บวกแต้มสำเร็จ' : '➖ ลบแต้มสำเร็จ')
+                .setDescription(`ลูกค้า : ${target}\n${isAdd ? 'บวกแต้ม' : 'หักแต้ม'} : \`${isAdd ? '+' : '-'}${n}\`\nแต้มเดิม : \`${r.before}\` → คงเหลือ : **${r.after}** แต้ม` + (reason ? `\nเหตุผล : ${reason}` : ''))
+                .setFooter({ text: `โดย ${interaction.user.username}` }));
         }
-
-        return;
+    } catch (err) {
+        console.error(`❌ คำสั่ง /${name} error:`, err);
+        await interaction.editReply({ content: '❌ เกิดข้อผิดพลาดระหว่างทำคำสั่ง ลองใหม่อีกครั้งครับ', allowedMentions: { parse: [] } }).catch(() => {});
     }
-
-});
-
-// ════════════════════════════════════════════════════════════
-//  TICKET FLOW
-//
-//  create_ticket → สร้างห้องตั๋วทันที ไม่ถามอะไรเลย
-//  แอดมินใช้ !qr [ยอด] [ห้อง] เพื่อแจ้งยอด+สร้าง QR เมื่อไหร่ก็ได้ ห้องไหนก็ได้
-//  ADMIN: btn_work (รับงาน)  |  btn_done (ปิดห้อง — แอดมินหรือเจ้าของตั๋วกดได้)
-// ════════════════════════════════════════════════════════════
+}
 
 client.on('interactionCreate', async (interaction) => {
     try {
+        // ── slash commands ──
+        if (interaction.isChatInputCommand()) { await handleSlash(interaction); return; }
+
         // ─────────────────────────────────────────────────────────
         //  create_ticket → สร้างห้องตั๋วทันที
         // ─────────────────────────────────────────────────────────
