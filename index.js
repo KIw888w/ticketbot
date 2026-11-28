@@ -32,13 +32,13 @@ const fs = require('fs');
 // [ 3. Config / Constants ]
 // ==========================================
 // ⚠️ แก้ไอดีเหล่านี้ให้ตรงกับเซิร์ฟเวอร์ของคุณก่อนรันบอท
-const ADMIN_ROLE_ID          = '1555146265958944878'; // Role แอดมินที่รับตั๋ว/สร้าง QR ได้
-const TICKET_CATEGORY_ID     = '1554881839422906495'; // Category สำหรับสร้างห้องตั๋ว
-const DONE_CATEGORY_ID       = '1554881839745994884'; // Category ที่ย้ายห้องไปเก็บหลังปิดตั๋ว
-const REVIEW_CHANNEL_ID      = '1554881839745994883'; // ห้องรีวิว (เอาไว้นับจำนวน)
+const ADMIN_ROLE_ID          = '1558736251027464243'; // Role แอดมินที่รับตั๋ว/สร้าง QR ได้
+const TICKET_CATEGORY_ID     = '1558736266122756187'; // Category สำหรับสร้างห้องตั๋ว
+const DONE_CATEGORY_ID       = ''; // Category ที่ย้ายห้องไปเก็บหลังปิดตั๋ว
+const REVIEW_CHANNEL_ID      = '1558740285960495134'; // ห้องรีวิว (เอาไว้นับจำนวน)
 
-const PROMPTPAY_NUMBER = '0621473585'; // เบอร์พร้อมเพย์รับเงิน
-const REVIEW_REACTIONS = ['<a:237291pinkhearts:1557040976973795438> ','<a:blackverified:1556884242041020456> ','<a:1394253573344329778:1564675042829271060> ','<a:1486114861787254874:1564570857165037568> ']; // อีโมจิที่บอทกดใต้รีวิวลูกค้า (เพิ่มได้หลายอัน เช่น ['❤️', '⭐']) — อีโมจิเซิร์ฟเวอร์ใช้รูปแบบ '<:ชื่อ:ไอดี>' หรือใส่แค่ไอดี
+const PROMPTPAY_NUMBER = '0620801285'; // เบอร์พร้อมเพย์รับเงิน
+const REVIEW_REACTIONS = ['<a:emoji_13:1575721661012119604>' ,'<a:emoji_16:1575721720008937553>','<a:emoji_123:1575725308265365504>','<a:02_ohmalord_70:1575724446977892485>'];
 
 const QUEUE_FILE        = './queue.txt';
 const TICKET_FILE       = './active_tickets.json';
@@ -46,15 +46,15 @@ const REVIEW_COUNT_FILE = './review_count.json';
 
 // อีโมจิกำหนดเองของเซิร์ฟเวอร์ (ใช้กับปุ่มต่างๆ)
 const BTN_EMOJI = {
-    work:    { id: '1561005772597493930', name: 'work' },
-    done:    { id: '1556884242041020456', name: 'blackverified', animated: true },
-    close:   { id: '1285847714076033114', name: 'close' },
-    contact: { id: '1561005772597493930', name: 'contact' }
+    work:    { id: '<a:a13:1575722954266910773> ', name: 'work' },
+    done:    { id: '', name: 'blackverified', animated: true },
+    close:   { id: '<a:1044809295558103040:1575730330885947412> ', name: 'close' },
+    contact: { id: '1549041283266248714', name: 'contact' }
 };
 
-const LOG_CHANNEL_ID = '1568982552969224315';   // ห้อง log สรุปตอนลบห้องตั๋ว (ว่าง = ไม่ส่ง log)
+const LOG_CHANNEL_ID = '1576212746838736936';   // ห้อง log สรุปตอนลบห้องตั๋ว (ว่าง = ไม่ส่ง log)
 // ห้องโชว์สินค้าที่จัดส่งแล้ว (ส่งสรุปออเดอร์ให้คนอื่นเห็นตอนกดปิดห้อง)
-const PRODUCT_CHANNELS = { nitro: '1566033586744987698', frame: '1566033685491486720' };
+const PRODUCT_CHANNELS = { nitro: '1558742285288472667', frame: '1558742508555735070' };
 const PRODUCT_LABEL = {
     nitro: 'Nitro', frame: 'กรอบรูป', cancel: 'ยกเลิก',
     box: 'กรอบรูป', effect: 'เอฟเฟค', avframe: 'เฟรม', nameplate: 'ป้ายชื่อ',
