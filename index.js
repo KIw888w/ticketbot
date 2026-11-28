@@ -46,9 +46,9 @@ const REVIEW_COUNT_FILE = './review_count.json';
 
 // อีโมจิกำหนดเองของเซิร์ฟเวอร์ (ใช้กับปุ่มต่างๆ)
 const BTN_EMOJI = {
-    work:    { id: '<a:a13:1575722954266910773> ', name: 'work' },
-    done:    { id: '', name: 'blackverified', animated: true },
-    close:   { id: '<a:1044809295558103040:1575730330885947412> ', name: 'close' },
+    work:    { id: '1575722954266910773', name: 'a13', animated: true },
+    done:    { name: '✅' },   // ยังไม่มีไอดีอีโมจิ → ใช้อีโมจิปกติไปก่อน (ใส่ { id: 'ไอดี', name: 'ชื่อ', animated: true } ได้ภายหลัง)
+    close:   { id: '1575730330885947412', name: '1044809295558103040', animated: true },
     contact: { id: '1549041283266248714', name: 'contact' }
 };
 
@@ -1345,10 +1345,10 @@ client.on('interactionCreate', async (interaction) => {
 // ==========================================
 // ⚠️ ห้ามเขียนโทเคนตรงๆ ในโค้ด — ใส่ไว้ในไฟล์ .env เป็น TOKEN=your_token_here
 // ══════════════════════════════════════════════════════════
-//  เช็คเรทกรอบรูป (Comet New) — ห้องเช็คเรทเท่านั้น
+//  เช็คเรทกรอบรูป (𝑷𝑰𝑲𝑼𝑳 𝑺𝑯𝑶𝑷) — ห้องเช็คเรทเท่านั้น
 // ══════════════════════════════════════════════════════════
 const RATE_CHECK_CHANNEL_ID = '1574745487490285699';
-const RATE_SHOP_NAME        = 'Comet New';
+const RATE_SHOP_NAME        = '𝑷𝑰𝑲𝑼𝑳 𝑺𝑯𝑶𝑷';
 
 // ไฟล์เรทที่แอดมินแก้เองได้: rates.json  รูปแบบ: [{"name":"บันเดิล Venom","discordPrice":739,"shopPrice":270}, ...]
 const RATES_FILE = require('path').join(__dirname, 'rates.json');
